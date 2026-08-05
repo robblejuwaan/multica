@@ -95,6 +95,22 @@ on:
   issue_comment:
     types: [created]
 
+# Deduplicate repeats of the SAME event only. pull_request_target and
+# pull_request_review both legitimately run for one SHA — the first looks
+# for an existing Codex review, the second fires when a review lands — so
+# grouping across events could cancel the run that was about to post the
+# status and leave the PR blocked forever.
+concurrency:
+  group: codex-review-${{ github.event.pull_request.number || github.event.issue.number }}-${{ github.event_name }}
+  # CANCEL ONLY THE PUSH-DRIVEN PATH. pull_request_target repeats when you push
+  # again, and the older run is genuinely superseded. pull_request_review and
+  # issue_comment are ONE-SHOT events carrying information no later run
+  # reproduces: cancelling them can kill the very run that was about to post
+  # `codex-review`, and the replacement (a human comment, author != the Codex
+  # bot) will not post it — leaving the required check missing forever on a PR
+  # that WAS reviewed. Introduced and caught in review the same day. (Codex P2.)
+  cancel-in-progress: ${{ github.event_name == 'pull_request_target' }}
+
 permissions:
   pull-requests: read
   statuses: write
