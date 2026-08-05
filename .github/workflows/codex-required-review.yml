@@ -1,0 +1,389 @@
+name: Codex Required Review
+
+# Posts a `codex-review` GitHub status check on a PR's head commit so
+# branch protection can require Codex to actually review before merge.
+#
+# Why this exists: chatgpt-codex-connector emits PR reviews but does NOT
+# emit GitHub Actions check-runs or commit statuses. Branch protection's
+# `required_status_checks.contexts` can only require a status check, not
+# a PR review. Without this shim, "require Codex review" can't be
+# enforced — see docs/audits/2026-05-04-codex-portfolio-audit.md.
+#
+# Codex has TWO observed response shapes (AHAD-15, 2026-05-05):
+#   A. Formal PR review (auto-triggered on PR open). Fires the
+#      pull_request_review event. Detected via the reviews API
+#      with commit_id == head SHA.
+#   B. Issue-comment reply to an `@codex review` mention. Does NOT
+#      fire pull_request_review. Detected via issue_comment event on
+#      the PR with author == chatgpt-codex-connector[bot] and a body
+#      whose first content line starts with `Codex Review` (matches
+#      both `Codex Review: Didn't find any major issues...` and
+#      `### 💡 Codex Review` markdown shapes).
+#
+# Shape B was the bin#7 stall (AHAD-12, 77 min open with required check
+# never posted) — Codex had reviewed via comment, but the shim only
+# listened for shape A.
+#
+# Behavior:
+#   - On PR open / synchronize / reopened: post `codex-review` as
+#     `success` if a Codex formal review already exists for the head
+#     SHA; otherwise post nothing (the missing required check is the
+#     pending signal — branch protection treats it as blocking).
+#   - On Codex submitting a formal review (pull_request_review event):
+#     post `codex-review` as `success` for that head commit.
+#   - On Codex commenting via @-mention (issue_comment event from
+#     chatgpt-codex-connector[bot]): post `codex-review` as `success`
+#     for the current head SHA, gated on TWO checks:
+#       (1) Prefix guard — body's first content line matches
+#           `Codex Review` (rejects refusals + non-review comments).
+#       (2) Anti-stale-bypass — HEAD wasn't pushed between the
+#           review request and the bot response. Composed of:
+#           - Mention selection: the @codex mention this response
+#             is for is the OLDEST unanswered one — earliest
+#             non-bot @codex comment after the last bot
+#             Codex-Review-shape comment (Codex P1 #3, AHAD-15
+#             own-PR review). Latest-mention heuristics let an
+#             attacker decoy a stale response onto a new SHA.
+#           - Push timestamp: from `actions/runs` filtered to
+#             `event=pull_request_target`, which is server-side
+#             and ungameable. `commit.committer.date` lives on
+#             the commit object and `git commit --date=…` would
+#             defeat that gate (Codex P1 #2).
+#           - Comparison: STRICT `<` so equal-second push/mention
+#             pairs (same UTC second) are rejected as
+#             unverifiable (Codex P2).
+#     Force-push AFTER a successful comment-shape post naturally
+#     invalidates the gate because the new HEAD has no status check
+#     posted; a fresh `@codex review` nudge re-fires this path.
+#
+# What "passing" means: Codex has submitted any review for the current
+# head SHA. The shim does not judge severity of findings — that stays
+# with the human reviewer. The gate is on review LATENCY (review must
+# happen before merge), which was the actual gap PR #84 surfaced.
+#
+# Status check context name is `codex-review` (not `codex` — the latter
+# would never fire because Codex doesn't post that name itself).
+#
+# Why never-post-pending instead of explicit-pending: any GET-then-POST
+# guard has a TOCTOU race window where a pull_request run that started
+# before Codex reviewed could overwrite a freshly-posted success with
+# pending. Posting only on success eliminates the race entirely. The
+# UX is identical from the merge-gate perspective — missing required
+# check = waiting = blocked.
+
+# Trigger: pull_request_target instead of pull_request. Codex P1 round 6
+# caught that pull_request runs the workflow from the PR's branch — a
+# contributor could modify this file in their PR to post
+# codex-review=success for their own SHA before Codex reviews, bypassing
+# the gate this shim is meant to enforce.
+#
+# pull_request_target runs from the BASE BRANCH (main) instead, so the
+# workflow code that owns this status is always the trusted version. This
+# job never checks out the PR source (it only calls the GitHub API), so
+# the standard pull_request_target risk — running untrusted PR code with
+# elevated privileges — does not apply. As a side benefit
+# pull_request_target also gives a writable GITHUB_TOKEN on fork PRs,
+# which closes the earlier P2 about read-only token on forks.
+#
+# issue_comment runs from the default branch as well, so the same
+# trust-the-base-branch property holds for the comment-shape path.
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+  pull_request_review:
+    types: [submitted]
+  issue_comment:
+    types: [created]
+
+permissions:
+  pull-requests: read
+  statuses: write
+  checks: write
+  # actions: read is required by the comment-shape anti-stale guard so it
+  # can query workflow_runs for trustworthy push timestamps. commit dates
+  # on the commit object are gameable (Codex P1 #2, AHAD-15 own-PR review).
+  actions: read
+
+jobs:
+  post-status:
+    # issue_comment fires for both issue and PR comments — skip non-PR comments.
+    if: github.event_name != 'issue_comment' || github.event.issue.pull_request != null
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve PR number and head SHA
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_FROM_PR_EVENT: ${{ github.event.pull_request.number }}
+          PR_FROM_ISSUE_EVENT: ${{ github.event.issue.number }}
+        run: |
+          set -euo pipefail
+          # Always resolve from the API so the SHA is consistent across
+          # event types: review.submitted gives review.commit_id which can
+          # lag the actual PR head by a tick during rapid pushes; issue_comment
+          # carries no SHA at all (it's tied to the issue/PR, not the commit).
+          if [ "$EVENT_NAME" = "issue_comment" ]; then
+            pr_number="$PR_FROM_ISSUE_EVENT"
+          else
+            pr_number="$PR_FROM_PR_EVENT"
+          fi
+          head_sha=$(gh api "repos/${{ github.repository }}/pulls/${pr_number}" --jq '.head.sha')
+          echo "pr_number=${pr_number}" >> "$GITHUB_OUTPUT"
+          echo "head_sha=${head_sha}" >> "$GITHUB_OUTPUT"
+          echo "Resolved PR #${pr_number} head SHA: ${head_sha}"
+
+      # PASSIVE-PROSE CARVE-OUT (aios-specific, 2026-08-05).
+      #
+      # Robb named these surfaces as documentation-shaped, not code Codex
+      # should evaluate. The previous aios-local workflow expressed that as a
+      # `paths-ignore:` on the trigger — which is a TRAP once `codex-review` is
+      # a REQUIRED check: a workflow that never runs never reports, and branch
+      # protection shows "Waiting for status to be reported" forever. A
+      # docs-only PR would have been permanently unmergeable.
+      #
+      # So the carve-out moves INSIDE the job: the workflow always runs and
+      # always reports. A passive-prose-only diff posts success immediately with
+      # a description that says why, so the exemption is visible on the PR rather
+      # than silent. Operative agent policy (SKILL.md, CLAUDE.md, AGENTS.md,
+      # bin/**, .github/**) is deliberately NOT exempt — it is executable
+      # instruction, not prose.
+      - name: Passive-prose carve-out
+        id: docsonly
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
+        run: |
+          set -euo pipefail
+          files=$(gh api --paginate "repos/${{ github.repository }}/pulls/${PR_NUMBER}/files" --jq '.[].filename')
+          if [ -z "$files" ]; then
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+            echo "No files resolved; not treating as docs-only (fail closed)."
+            exit 0
+          fi
+          non_prose=0
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            case "$f" in
+              decisions/*|references/*|context/*|README.md|LICENSE) ;;
+              *) non_prose=1 ;;
+            esac
+          done <<< "$files"
+          if [ "$non_prose" -eq 0 ]; then
+            echo "docs_only=true" >> "$GITHUB_OUTPUT"
+            echo "All changed files are passive prose; exempting."
+          else
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Post carve-out status
+        if: steps.docsonly.outputs.docs_only == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
+        run: |
+          set -euo pipefail
+          gh api -X POST "repos/${{ github.repository }}/statuses/${HEAD_SHA}" \
+            -f state="success" \
+            -f context="codex-review" \
+            -f description="exempt: passive prose only (decisions/references/context/README/LICENSE)" \
+            -f target_url="https://github.com/${{ github.repository }}/pull/${PR_NUMBER}/files"
+          echo "Posted codex-review=success (passive-prose carve-out) on ${HEAD_SHA}"
+
+      - name: Determine Codex approval (formal review or @-mention comment)
+        if: steps.docsonly.outputs.docs_only != 'true'
+        id: codex
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          COMMENT_USER: ${{ github.event.comment.user.login }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          COMMENT_TIME: ${{ github.event.comment.created_at }}
+        run: |
+          set -euo pipefail
+
+          # Path A — formal pull_request_review on the current head SHA.
+          # Always run this check. Pagination: GitHub returns reviews in
+          # chronological order (oldest first), so a long-lived PR with
+          # many force-pushes could push the latest Codex review onto page
+          # 2+. `--paginate` fetches every page; `jq -s` (slurp) aggregates
+          # before filtering. The per-page jq form (`--paginate --jq ...`)
+          # emits one length per page and doesn't compose under bash
+          # integer comparison.
+          reviewed=$(
+            gh api --paginate "repos/${{ github.repository }}/pulls/${PR_NUMBER}/reviews" \
+              | jq -s "[.[] | .[] | select(.user.login == \"chatgpt-codex-connector[bot]\") | select(.commit_id == \"${HEAD_SHA}\")] | length"
+          )
+
+          # Path B — issue_comment from chatgpt-codex-connector[bot] with
+          # a Codex-Review prefix. Only consider this on issue_comment
+          # events. Two-stage validation:
+          #   B1. Prefix guard on body: rejects refusal/non-review shapes.
+          #   B2. Anti-stale-bypass guard: confirms HEAD didn't advance
+          #       between the @codex-review nudge and the bot response.
+          #       Without this, a contributor could request review at
+          #       SHA A, force-push SHA B before Codex finishes, and the
+          #       bot's reply would falsely stamp SHA B as reviewed.
+          #       (Codex P1, AHAD-15 own-PR review.)
+          # A subsequent force-push AFTER the comment naturally invalidates
+          # the gate because the new HEAD has no status check posted; a
+          # fresh @codex-review nudge re-fires this path.
+          commented=0
+          if [ "$EVENT_NAME" = "issue_comment" ] \
+             && [ "$COMMENT_USER" = "chatgpt-codex-connector[bot]" ]; then
+            # B1 — defensive prefix guard. Two known Codex review-comment
+            # shapes (samples 2026-05-05 across portfolio):
+            #   1. "Codex Review: Didn't find any major issues..."
+            #      — first content line starts with `Codex Review:`
+            #   2. "\n### 💡 Codex Review\n\n[diff link]\n**P1 Badge | ..."
+            #      — first non-blank line is `### 💡 Codex Review` (own
+            #        line, optional emoji, exact phrase, no colon)
+            # Both indicate a real review submission. The guard rejects
+            # hypothetical refusal comments ("Sorry, I can't review this
+            # PR because...") because they'd lack the leading `Codex
+            # Review` token.
+            #
+            # head -3 covers shape 2's leading newline (line 1 is empty,
+            # line 2 is the heading). The regex anchors `Codex Review`
+            # to start-of-line (after optional `#{1,3} 💡 ` markdown),
+            # then requires either end-of-line or a `:`.
+            prefix_ok=0
+            if printf '%s' "$COMMENT_BODY" | head -3 \
+                | grep -qE '^[[:space:]]*(#{1,3}[[:space:]]*(💡[[:space:]]*)?)?Codex Review([[:space:]]*$|:)'; then
+              prefix_ok=1
+            fi
+
+            if [ "$prefix_ok" = "1" ]; then
+              # B2 — bind comment to a stable head SHA. Codex sees the
+              # diff at @-mention time; if HEAD advances before the bot
+              # responds, the response is for the old commit.
+              #
+              # Mention selection. THIS bot response is for the OLDEST
+              # @codex mention that hasn't already been replied-to. Pick
+              # the earliest non-bot @codex mention that came AFTER the
+              # prior Codex-Review-shape bot comment (or earliest of all
+              # if none prior). Why not "latest mention before response":
+              # an attacker could request review on SHA A, push SHA B,
+              # then add a decoy `@codex` mention after the push so the
+              # latest-mention-before-response heuristic accepts the bot
+              # reply (which was for SHA A) as if it were for SHA B —
+              # Codex P1 #3, AHAD-15 own-PR review.
+              # The "is this a Codex Review-shape bot comment" pattern
+              # matches both observed shapes:
+              #   - Shape A "Codex Review: ..." (start-of-string)
+              #   - Shape B "\n### 💡 Codex Review\n..." (start-of-line
+              #     after the leading blank line of markdown shape)
+              # Codex P1 #4 (AHAD-15 own-PR review): the previous regex
+              # `^.{0,100}Codex Review` failed shape B because `.` does
+              # not consume newlines in Oniguruma without a flag — the
+              # markdown shape's leading newline placed `Codex Review`
+              # past where `^.{0,100}` could anchor. Using `(^|\n)`
+              # explicitly matches both start-of-string and after-newline.
+              prior_bot_review_time=$(
+                gh api --paginate "repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" \
+                  | jq -s -r --arg t "$COMMENT_TIME" \
+                    '[.[] | .[] | select(.user.login == "chatgpt-codex-connector[bot]") | select(.created_at < $t) | select(.body | test("(^|\n)[[:space:]]*(#{1,3}[[:space:]]*(💡[[:space:]]*)?)?Codex Review([[:space:]]|:|$)"; "")) | .created_at] | sort | last // ""'
+              )
+
+              mention_time=$(
+                gh api --paginate "repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" \
+                  | jq -s -r --arg t "$COMMENT_TIME" --arg p "$prior_bot_review_time" \
+                    '[.[] | .[] | select(.user.login != "chatgpt-codex-connector[bot]") | select(.created_at < $t) | select($p == "" or .created_at > $p) | select(.body | test("@codex"; "i")) | .created_at] | sort | first // ""'
+              )
+
+              if [ -z "$mention_time" ]; then
+                echo "Comment-shape rejected: no @codex mention found before bot response — auto-review path requires formal pull_request_review."
+              else
+                # Push-time proxy: latest pull_request_target workflow run
+                # on the current HEAD SHA. Why not commit.committer.date:
+                # that timestamp lives on the commit object and is set by
+                # the committer (gameable — `git commit --date=2020-01-01`
+                # would defeat the gate, Codex P1 #2). Why not commit
+                # timeline events: their `created_at` mirrors committer.date.
+                # actions/runs filtered to event=pull_request_target gives
+                # only opened/synchronize/reopened triggers — those are
+                # genuine push proofs whose `created_at` is server-side.
+                # VERIFIED 2026-08-05 — do not "fix" this to use the base SHA.
+                # A Codex pre-push review raised a P1 claiming that for
+                # pull_request_target runs GitHub associates the run's head_sha
+                # with the base/ref context rather than the PR head, which would
+                # make this filter match nothing and block every comment-shaped
+                # review forever. That claim is FALSE on this repo. Checked
+                # against five real runs:
+                #   run 30976459309 head_sha=ff516c2 == PR #163 head ff516c2
+                #   run 30980480608 head_sha=792c475 == PR #164 head 792c475
+                # pull_request_target runs DO carry the PR head SHA. Applying the
+                # suggested fix would have broken a working anti-stale guard.
+                latest_push_time=$(
+                  gh api --paginate "repos/${{ github.repository }}/actions/runs?event=pull_request_target&head_sha=${HEAD_SHA}" \
+                    | jq -s -r '[.[] | .workflow_runs[] | .created_at] | sort | last // ""'
+                )
+
+                # ISO-8601 UTC strings (e.g. 2026-05-06T07:43:18Z) sort
+                # lexicographically because all components are zero-padded
+                # fixed-width and the timezone is uniform. `\<` invokes
+                # POSIX [ string comparison.
+                #
+                # Strict <: equal-second values are treated as unverifiable
+                # and rejected (Codex P2, AHAD-15 own-PR re-review). GitHub
+                # truncates created_at to whole seconds; an automated caller
+                # could mention and force-push within the same UTC second
+                # and otherwise sneak past an `<=` comparison.
+                if [ -z "$latest_push_time" ]; then
+                  echo "Comment-shape rejected: no pull_request_target run found for ${HEAD_SHA} — cannot verify push time."
+                elif [ "$latest_push_time" \< "$mention_time" ]; then
+                  commented=1
+                  echo "Comment-shape accepted: mention at $mention_time, last push at $latest_push_time, response at $COMMENT_TIME."
+                else
+                  echo "Comment-shape rejected: HEAD push at $latest_push_time is not strictly before @codex-review mention at $mention_time — equal-second or later treated as stale."
+                fi
+              fi
+            fi
+          fi
+
+          if [ "${reviewed}" -gt 0 ] || [ "${commented}" -gt 0 ]; then
+            echo "state=success" >> "$GITHUB_OUTPUT"
+            if [ "${reviewed}" -gt 0 ]; then
+              echo "description=Codex reviewed this commit" >> "$GITHUB_OUTPUT"
+              echo "Codex reviewed via formal PR review for ${HEAD_SHA}: success"
+            else
+              echo "description=Codex reviewed via @-mention comment" >> "$GITHUB_OUTPUT"
+              echo "Codex reviewed via @-mention comment for ${HEAD_SHA}: success"
+            fi
+          else
+            echo "state=pending" >> "$GITHUB_OUTPUT"
+            echo "description=Awaiting Codex review on this commit" >> "$GITHUB_OUTPUT"
+            echo "Codex has NOT yet reviewed ${HEAD_SHA}: pending"
+          fi
+
+      - name: Post commit status (success only — never post pending)
+        if: steps.codex.outputs.state == 'success'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
+          DESCRIPTION: ${{ steps.codex.outputs.description }}
+        run: |
+          set -euo pipefail
+
+          # Only post when Codex has actually reviewed this commit.
+          # Skipping the `pending` post entirely eliminates the race where
+          # a pull_request run that GETs before Codex submits, then POSTs
+          # after the pull_request_review run already posted success,
+          # would regress the status. Any GET-then-POST guard still has a
+          # TOCTOU window; the cleaner fix is "no pending post."
+          #
+          # UX: a missing required status check shows as "Waiting for
+          # status to be reported" in branch-protection's merge UI, which
+          # is exactly the pending semantics we wanted from the explicit
+          # pending state. Branch protection treats a missing required
+          # check as blocking — equivalent to pending for gating purposes.
+          gh api -X POST "repos/${{ github.repository }}/statuses/${HEAD_SHA}" \
+            -f state="success" \
+            -f context="codex-review" \
+            -f description="${DESCRIPTION}" \
+            -f target_url="https://github.com/${{ github.repository }}/pull/${PR_NUMBER}/files"
+          echo "Posted codex-review=success on ${HEAD_SHA}"
