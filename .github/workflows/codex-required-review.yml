@@ -56,10 +56,55 @@ name: Codex Required Review
 #     invalidates the gate because the new HEAD has no status check
 #     posted; a fresh `@codex review` nudge re-fires this path.
 #
-# What "passing" means: Codex has submitted any review for the current
-# head SHA. The shim does not judge severity of findings — that stays
-# with the human reviewer. The gate is on review LATENCY (review must
-# happen before merge), which was the actual gap PR #84 surfaced.
+# What "passing" means: Codex has submitted a review for the current head
+# SHA **and that review raised no P0/P1**. The gate covers review LATENCY
+# (review must happen before merge — the gap PR #84 surfaced) AND review
+# SEVERITY (SAN-314).
+#
+# SEVERITY (SAN-314, 2026-08-06). Until this change the shim posted
+# `success` on any Codex response, so at the merge button "codex-review
+# passed" and "Codex found nothing serious" were different statements that
+# looked identical — and auto-merge landed P1s behind a green check.
+# Measured, not theorised: eva-chen PR #25 merged as c1b33b3 with
+# codex-review=SUCCESS while Codex had filed 2 P1 + 2 P2 on that head. A
+# 14-PR sample taken while writing this found SEVEN more carrying a P1
+# under a green check.
+#
+# WHERE THE SEVERITY LIVES — the part that makes the naive fix wrong.
+# Codex puts findings in TWO places, and a gate that reads only one of
+# them reproduces the bug:
+#   1. Inline review comments (`pulls/{n}/comments`). This is the usual
+#      shape — eva-chen #25's 2 P1 were here and the review BODY was pure
+#      boilerplate ("Here are some automated review suggestions"). Parsing
+#      only the body would have posted green on the very merge that
+#      motivated this ticket.
+#   2. The review body itself. media-capture-app #43 has zero inline
+#      comments and a P1 in the body. Parsing only the comments would
+#      have missed that one.
+# Both are scanned. Each finding is rendered as a shields.io badge —
+# `**<sub><sub>![P1 Badge](https://img.shields.io/badge/P1-orange…)`— so
+# the alt text and the badge URL both carry the level.
+#
+# BINDING: findings are matched to reviews via `pull_request_review_id`,
+# NOT via the comment's own `commit_id`. A review comment's `commit_id`
+# tracks the diff as the PR advances, so a fixed-and-re-pushed P1 could
+# keep failing forever. Anchoring on the review that raised it means a new
+# head SHA starts from a clean slate, exactly like the latency gate does.
+#
+# FAIL CLOSED ON FORMAT DRIFT: Codex only leaves inline comments when it
+# has findings, and every finding carries a P0–P3 badge. So a finding that
+# matches NO severity pattern means the format moved under us — that posts
+# `failure` with an explicit description rather than silently grading it
+# green. This is the one guard that keeps a future Codex re-skin from
+# quietly restoring the original bug.
+#
+# BREAK GLASS: a false-positive P1 must not wedge a PR forever. Applying
+# the `codex-p1-ack` label posts `success` with the override named in the
+# status description, so the dismissal is a visible act rather than a
+# silent one. The override only ever downgrades a SEVERITY verdict: it
+# requires a `codex-review` status to already exist on this head SHA, so
+# it cannot be used to skip review altogether. Label changes re-run this
+# workflow (see the `labeled`/`unlabeled` triggers).
 #
 # Status check context name is `codex-review` (not `codex` — the latter
 # would never fire because Codex doesn't post that name itself).
@@ -89,7 +134,11 @@ name: Codex Required Review
 # trust-the-base-branch property holds for the comment-shape path.
 on:
   pull_request_target:
-    types: [opened, synchronize, reopened]
+    # labeled/unlabeled are here for the `codex-p1-ack` break-glass path
+    # (SAN-314). Applying a label fires no other trigger, so without these
+    # the override could never post and a false-positive P1 would wedge the
+    # PR until someone pushed a commit.
+    types: [opened, synchronize, reopened, labeled, unlabeled]
   pull_request_review:
     types: [submitted]
   issue_comment:
@@ -119,6 +168,10 @@ permissions:
   # can query workflow_runs for trustworthy push timestamps. commit dates
   # on the commit object are gameable (Codex P1 #2, AHAD-15 own-PR review).
   actions: read
+  # issues: read backs the `codex-p1-ack` break-glass path — the PR
+  # timeline is served by the issues API and is where the label's actor
+  # comes from, so an override can name who made it (SAN-314).
+  issues: read
 
 jobs:
   post-status:
@@ -360,6 +413,13 @@ jobs:
             fi
           fi
 
+          # `reviewed` / `commented` are exported so the severity step knows
+          # WHICH path proved the review, and therefore where to look for
+          # findings: path A findings live on the reviews, path B findings
+          # live in the triggering comment body. (SAN-314.)
+          echo "reviewed=${reviewed}" >> "$GITHUB_OUTPUT"
+          echo "commented=${commented}" >> "$GITHUB_OUTPUT"
+
           if [ "${reviewed}" -gt 0 ] || [ "${commented}" -gt 0 ]; then
             echo "state=success" >> "$GITHUB_OUTPUT"
             if [ "${reviewed}" -gt 0 ]; then
@@ -375,13 +435,231 @@ jobs:
             echo "Codex has NOT yet reviewed ${HEAD_SHA}: pending"
           fi
 
-      - name: Post commit status (success only — never post pending)
-        if: steps.codex.outputs.state == 'success'
+      # ---------------------------------------------------------------
+      # SEVERITY (SAN-314). "Codex responded" is not "Codex was happy".
+      # Grade the findings Codex filed against THIS head SHA and decide
+      # whether the required check should be success or failure.
+      # ---------------------------------------------------------------
+      - name: Grade finding severity
+        if: steps.docsonly.outputs.docs_only != 'true'
+        id: severity
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          REVIEWED: ${{ steps.codex.outputs.reviewed }}
+          COMMENTED: ${{ steps.codex.outputs.commented }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+        run: |
+          set -euo pipefail
+
+          # Codex renders every finding with a shields.io severity badge:
+          #   **<sub><sub>![P1 Badge](https://img.shields.io/badge/P1-orange?style=flat)</sub></sub>  Title**
+          # Both the alt text and the badge URL carry the level, so either
+          # anchor alone is sufficient — matching both is belt and braces
+          # against one of the two being restyled. The trailing shapes
+          # (`[P1]`, `**P1**`, `P1:`) cover the plainer prose summaries.
+          #
+          # `[^A-Za-z0-9/]` before the bare-token alternative is what stops
+          # the badge URL's own `…/badge/P1-orange` path segment from being
+          # double-counted, and stops words like "GP1" matching.
+          #
+          # VERIFIED against 14 real PRs across 5 repos before rollout
+          # (7 with a P0/P1, 7 without): 14/14 agreement with an
+          # independent hand-check, no false pass, no false block, and no
+          # finding that failed to classify. Do not loosen these without
+          # re-running that comparison — a false PASS here is invisible and
+          # restores the exact bug this closes.
+          # One spelling, two engines: jq's --arg passes the pattern through
+          # uninterpreted, so the same single-backslash form is valid for
+          # both jq's test() and grep -E below. Verified as a truth table
+          # rather than assumed — the doubled-backslash form ALSO appears to
+          # work, for the wrong reason, which is precisely the kind of thing
+          # that rots silently.
+          BLOCKING='(P[01][[:space:]]+Badge|badge/P[01]-|\[P[01]\]|\*\*P[01]\*\*|(^|[^A-Za-z0-9/])P[01][[:space:]]*[:.)])'
+          CLASSIFIED='(P[0-3][[:space:]]+Badge|badge/P[0-3]-|\[P[0-3]\]|\*\*P[0-3]\*\*|(^|[^A-Za-z0-9/])P[0-3][[:space:]]*[:.)])'
+
+          blocking=0
+          unclassified=0
+          findings=0
+
+          # --- Path A: findings attached to formal reviews on this SHA ---
+          # Two paginated calls total, regardless of review count. Reviews
+          # and comments are joined in jq on pull_request_review_id.
+          if [ "${REVIEWED:-0}" -gt 0 ]; then
+            reviews_json=$(gh api --paginate "repos/${{ github.repository }}/pulls/${PR_NUMBER}/reviews" | jq -s '[.[] | .[]]')
+            comments_json=$(gh api --paginate "repos/${{ github.repository }}/pulls/${PR_NUMBER}/comments" | jq -s '[.[] | .[]]')
+
+            read -r findings blocking unclassified < <(
+              jq -n -r \
+                --argjson reviews "$reviews_json" \
+                --argjson comments "$comments_json" \
+                --arg sha "$HEAD_SHA" \
+                --arg blocking "$BLOCKING" \
+                --arg classified "$CLASSIFIED" '
+                def bot: "chatgpt-codex-connector[bot]";
+
+                ($reviews | map(select(.user.login == bot and .commit_id == $sha))) as $rv
+                | ($rv | map(.id)) as $ids
+
+                # Top-level inline comments belonging to those reviews.
+                # in_reply_to_id == null drops conversational replies
+                # ("@codex address that feedback"), which are not findings
+                # and would otherwise trip the unclassified guard.
+                | ($comments | map(select(
+                    .user.login == bot
+                    and .in_reply_to_id == null
+                    and ((.pull_request_review_id) as $p | $ids | index($p)) != null
+                  ))) as $fx
+
+                | ( [ $rv[] | (.body // "") | select(test($blocking)) ] | length ) as $body_blocking
+                | ( [ $fx[] | .body | select(test($blocking)) ] | length ) as $fx_blocking
+                | ( [ $fx[] | .body | select(test($classified) | not) ] | length ) as $fx_unclassified
+
+                | [ ($fx | length), ($body_blocking + $fx_blocking), $fx_unclassified ]
+                | @tsv
+              '
+            )
+          fi
+
+          # --- Path B: findings stated in the @-mention response body ---
+          # Path B is usually the clean shape ("Codex Review: Didn't find
+          # any major issues"), but if Codex ever states a P1 there it must
+          # block just the same. No unclassified guard here: prose is not
+          # the badge-per-finding format, so absence of a badge is normal.
+          if [ "${COMMENTED:-0}" -gt 0 ]; then
+            if printf '%s' "$COMMENT_BODY" | grep -qE "$BLOCKING"; then
+              blocking=$((blocking + 1))
+              echo "Path B: blocking severity stated in the Codex comment body."
+            fi
+          fi
+
+          echo "blocking=${blocking}" >> "$GITHUB_OUTPUT"
+          echo "unclassified=${unclassified}" >> "$GITHUB_OUTPUT"
+          echo "Severity on ${HEAD_SHA}: findings=${findings} blocking=${blocking} unclassified=${unclassified}"
+
+      # ---------------------------------------------------------------
+      # BREAK GLASS (SAN-314). A false-positive P1 must not wedge a PR.
+      # `codex-p1-ack` downgrades a severity FAILURE to success, named in
+      # the description so the dismissal is visible on the PR.
+      #
+      # It cannot be used to skip review: the override requires a
+      # `codex-review` status to ALREADY exist on this head SHA, which
+      # only ever gets posted after Codex has actually reviewed it.
+      # ---------------------------------------------------------------
+      - name: Resolve break-glass override
+        if: steps.docsonly.outputs.docs_only != 'true'
+        id: override
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+
+          has_label=$(
+            gh api "repos/${{ github.repository }}/pulls/${PR_NUMBER}" \
+              --jq '[.labels[].name] | index("codex-p1-ack") != null'
+          )
+          if [ "$has_label" != "true" ]; then
+            echo "active=false" >> "$GITHUB_OUTPUT"
+            echo "No codex-p1-ack label; no override."
+            exit 0
+          fi
+
+          # Anti-bypass: the label only downgrades an existing verdict.
+          existing=$(
+            gh api --paginate "repos/${{ github.repository }}/commits/${HEAD_SHA}/statuses" \
+              | jq -s '[.[] | .[] | select(.context == "codex-review")] | length'
+          )
+          if [ "$existing" -eq 0 ]; then
+            echo "active=false" >> "$GITHUB_OUTPUT"
+            echo "codex-p1-ack present but no codex-review status exists on ${HEAD_SHA} — Codex has not reviewed this commit, so there is nothing to override."
+            exit 0
+          fi
+
+          actor=$(
+            gh api --paginate "repos/${{ github.repository }}/issues/${PR_NUMBER}/timeline" \
+              | jq -s -r '[.[] | .[] | select(.event == "labeled") | select(.label.name == "codex-p1-ack") | .actor.login] | last // "unknown"'
+          )
+          echo "active=true" >> "$GITHUB_OUTPUT"
+          echo "actor=${actor}" >> "$GITHUB_OUTPUT"
+          echo "Override active: codex-p1-ack applied by ${actor}."
+
+      # ---------------------------------------------------------------
+      # Final verdict. Three outcomes, one of which is new:
+      #   success  — Codex reviewed, no P0/P1 (or override applied)
+      #   failure  — Codex reviewed and filed a P0/P1  <-- SAN-314
+      #   no post  — Codex has not reviewed this SHA (blocking, as before)
+      # ---------------------------------------------------------------
+      - name: Decide status to post
+        if: steps.docsonly.outputs.docs_only != 'true'
+        id: verdict
+        env:
+          REVIEW_STATE: ${{ steps.codex.outputs.state }}
+          BASE_DESCRIPTION: ${{ steps.codex.outputs.description }}
+          BLOCKING: ${{ steps.severity.outputs.blocking }}
+          UNCLASSIFIED: ${{ steps.severity.outputs.unclassified }}
+          OVERRIDE: ${{ steps.override.outputs.active }}
+          OVERRIDE_ACTOR: ${{ steps.override.outputs.actor }}
+        run: |
+          set -euo pipefail
+
+          blocking="${BLOCKING:-0}"
+          unclassified="${UNCLASSIFIED:-0}"
+
+          if [ "$REVIEW_STATE" != "success" ]; then
+            # Codex has not reviewed this SHA by either path. Unchanged
+            # behaviour: post nothing, because a missing required check is
+            # already the blocking signal and posting `pending` reopens the
+            # TOCTOU race documented below.
+            #
+            # One exception: an override on a PR whose review arrived via
+            # the comment path. That path's SHA binding is timing-based and
+            # cannot be recomputed on a later `labeled` run, so without this
+            # a path-B severity failure could never be broken out of.
+            if [ "${OVERRIDE:-false}" = "true" ]; then
+              echo "post=true" >> "$GITHUB_OUTPUT"
+              echo "state=success" >> "$GITHUB_OUTPUT"
+              echo "description=P0/P1 dismissed via codex-p1-ack by ${OVERRIDE_ACTOR}" >> "$GITHUB_OUTPUT"
+              echo "Override applied to an existing verdict on this SHA."
+            else
+              echo "post=false" >> "$GITHUB_OUTPUT"
+              echo "Codex has not reviewed this SHA; posting nothing."
+            fi
+            exit 0
+          fi
+
+          echo "post=true" >> "$GITHUB_OUTPUT"
+
+          if [ "$blocking" -gt 0 ] || [ "$unclassified" -gt 0 ]; then
+            if [ "${OVERRIDE:-false}" = "true" ]; then
+              echo "state=success" >> "$GITHUB_OUTPUT"
+              echo "description=P0/P1 dismissed via codex-p1-ack by ${OVERRIDE_ACTOR}" >> "$GITHUB_OUTPUT"
+              echo "Blocking findings present but dismissed by ${OVERRIDE_ACTOR}."
+            elif [ "$blocking" -gt 0 ]; then
+              echo "state=failure" >> "$GITHUB_OUTPUT"
+              echo "description=Codex filed ${blocking} P0/P1 on this commit — fix, or label codex-p1-ack" >> "$GITHUB_OUTPUT"
+              echo "FAILURE: ${blocking} blocking finding(s)."
+            else
+              echo "state=failure" >> "$GITHUB_OUTPUT"
+              echo "description=${unclassified} Codex finding(s) of unreadable severity — needs a human look" >> "$GITHUB_OUTPUT"
+              echo "FAILURE: ${unclassified} unclassified finding(s); failing closed on format drift."
+            fi
+          else
+            echo "state=success" >> "$GITHUB_OUTPUT"
+            echo "description=${BASE_DESCRIPTION} — no P0/P1" >> "$GITHUB_OUTPUT"
+            echo "SUCCESS: reviewed, no blocking findings."
+          fi
+
+      - name: Post commit status (graded verdict — never post pending)
+        if: steps.verdict.outputs.post == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
           PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
-          DESCRIPTION: ${{ steps.codex.outputs.description }}
+          STATE: ${{ steps.verdict.outputs.state }}
+          DESCRIPTION: ${{ steps.verdict.outputs.description }}
         run: |
           set -euo pipefail
 
@@ -397,9 +675,18 @@ jobs:
           # is exactly the pending semantics we wanted from the explicit
           # pending state. Branch protection treats a missing required
           # check as blocking — equivalent to pending for gating purposes.
+          #
+          # SAN-314: `state` is now graded rather than hardcoded to
+          # success. The residual race this leaves is benign and points the
+          # safe way: a slow run that graded an OLD review can only
+          # overwrite a newer success with a FAILURE, never the reverse, so
+          # the worst case blocks a mergeable PR (visible, cleared by a
+          # re-run) instead of releasing an unreviewed one.
+          #
+          # GitHub truncates status descriptions at 140 characters.
           gh api -X POST "repos/${{ github.repository }}/statuses/${HEAD_SHA}" \
-            -f state="success" \
+            -f state="${STATE}" \
             -f context="codex-review" \
             -f description="${DESCRIPTION}" \
             -f target_url="https://github.com/${{ github.repository }}/pull/${PR_NUMBER}/files"
-          echo "Posted codex-review=success on ${HEAD_SHA}"
+          echo "Posted codex-review=${STATE} on ${HEAD_SHA}: ${DESCRIPTION}"
