@@ -748,44 +748,34 @@ jobs:
               # and correct — the approval step rejects that case, but its
               # result was not consulted here. Comments naming a DIFFERENT
               # commit fall into neither bucket and are simply ignored.
-              # EVERY ELIGIBLE COMMENT REVIEW COUNTS — not the newest one.
+              # EVERY ELIGIBLE COMMENT COUNTS — no single winner is picked.
               #
-              # Two prior cuts each dropped findings here, in two different
-              # directions, and both drops post success over a live P0/P1:
+              # Two opposite false-PASSes killed the two obvious designs,
+              # and both were caught on live PRs:
+              #   - bound-takes-precedence: a SHA-bound CLEAN comment hid a
+              #     LATER untagged P0/P1 (independent review, 06:21Z).
+              #   - newest-eligible-wins: a later untagged CLEAN comment
+              #     superseded a SHA-bound P0/P1 without any anti-stale
+              #     check, so a response to a review requested on an older
+              #     SHA could clear a finding on this one (Codex P1 on
+              #     santos-brand#3 — filed by this gate running live).
+              # Picking ANY one comment loses a finding in one direction or
+              # the other, so the pool is unioned instead: every eligible
+              # comment contributes its findings, exactly as every formal
+              # review on this head already does. Supersession is not this
+              # step to decide — a genuinely stale P0/P1 is cleared by a new
+              # head SHA, or dismissed on the record with codex-p1-ack.
               #
-              #   1. bound-then-untagged precedence let a SHA-bound CLEAN
-              #      comment mask a LATER untagged one carrying a P0/P1,
-              #      because bound won unconditionally. Closed by pooling.
-              #   2. pooling and taking `last` still let a NEWER clean
-              #      comment mask an OLDER one carrying a P0/P1 — both
-              #      bound to this same head, so both are equally
-              #      trustworthy and there is no basis for the newer to
-              #      retract the older. Verified as a live false pass in
-              #      blob d2ef1d3a before this change.
-              #
-              # Selecting any single comment re-opens (2) in some ordering.
-              # So selection is dropped entirely: the eligible set is a
-              # union and every member is a finding. A P0/P1 stops blocking
-              # when it is fixed or acked, never because another comment
-              # arrived later.
-              #
-              # Eligibility is UNCHANGED, and is the part that must not
-              # loosen: a comment naming THIS head is always admissible; an
-              # untagged one only as re-grading evidence for a SHA the gate
-              # already accepted a review for ($prior) — that condition is
-              # what closed the force-push false pass. A comment naming a
-              # DIFFERENT commit is eligible under neither and is ignored.
-              #
-              # Same doctrine as the isOutdated-only thread filter and the
-              # >= on the ack comparison: unverifiable ordering resolves
-              # against the merge, never toward it. (SAN-314 review
-              # 2026-08-06; case 2 found by mutation test, not by the bot.)
+              # Eligibility, unchanged: a comment naming THIS head is always
+              # admissible; an untagged one only as re-grading evidence for a
+              # SHA the gate already accepted a review for. A comment naming
+              # a DIFFERENT commit is eligible under neither and is ignored.
               | ([ $issues[]
                    | select(.user.login == bot)
                    | select(.body | test($shape))
                    | select( (.body | contains($short))
                              or ((.body | test("Reviewed commit:") | not) and $prior != "none") )
-                 ] | sort_by(.created_at)) as $cm
+                 ] | sort_by(.created_at)) as $cms
 
               # One flat finding list: {ts, body, inline}. Review bodies and
               # the comment body count as one finding each; inline comments
@@ -794,7 +784,7 @@ jobs:
               # program is bash single-quoted, so one would end it early.
               | ( [ $rv[]  | {ts: .submitted_at, body: (.body // ""), inline: false} ]
                 + [ $fx[]  | {ts: (.createdAt // ""), body: (.body // ""), inline: true} ]
-                + [ $cm[] | {ts: .created_at, body: (.body // ""), inline: false} ]
+                + [ $cms[] | {ts: .created_at, body: (.body // ""), inline: false} ]
                 ) as $all
 
               # Live = not covered by the ack. An ack dismisses only what
@@ -809,7 +799,7 @@ jobs:
               # resolves against the merge, never toward it. Codex P1.
               | ( $all | map(select($ack == "" or .ts >= $ack)) ) as $live
 
-              | [ (if (($rv | length) > 0 or ($cm | length) > 0) then 1 else 0 end),
+              | [ (if (($rv | length) > 0 or ($cms | length) > 0) then 1 else 0 end),
                   ( [ $all[]  | select(.body | test($blocking)) ] | length ),
                   ( [ $all[]  | select(.inline) | select(.body | test($classified) | not) ] | length ),
                   ( [ $live[] | select(.body | test($blocking)) ] | length ),
@@ -900,17 +890,12 @@ jobs:
         run: |
           set -euo pipefail
 
-          # LAST-WRITER GUARD — now a SECOND line of defence, not the first.
-          #
-          # The concurrency group above no longer includes
-          # github.event_name, so runs for one PR serialize and the
-          # two-writers-one-status race is closed structurally. This guard
-          # stays because that serialization is GitHub's scheduler keeping a
-          # promise: it covers runs in ONE repo's queue, and the failure it
-          # protects against is silent and merge-releasing, while its own
-          # failure mode is a visible block cleared by a re-run. Cheap
-          # insurance in the safe direction; do not remove it on the grounds
-          # that the concurrency key made it redundant.
+          # LAST-WRITER GUARD. Event types are separate concurrency groups
+          # (the group key includes github.event_name), so a slow
+          # pull_request_target run can still be in flight when a
+          # pull_request_review run posts `failure` for a review that
+          # landed after we read our evidence. Without this, the slow run
+          # posts its stale `success` last and the P0/P1 goes green.
           #
           # This is not hypothetical: it is exactly how eva-chen#30 merged
           # with a live P1 — the base copy of this workflow posted success
@@ -920,13 +905,6 @@ jobs:
           # Only `success` is held back. A `failure` may always overwrite,
           # because erring toward blocking is the safe direction, and a
           # missing/incorrect block is visible where a false green is not.
-          #
-          # >= not >, for the same reason as the ack comparison in the
-          # severity step: GitHub truncates status timestamps to whole
-          # seconds, so a failure recorded in the SAME second this run read
-          # its evidence is unorderable against it. Under > that tie
-          # resolved toward the merge and the success overwrote it. Equal
-          # time now counts as newer, so the tie blocks. (SAN-314.)
           if [ "${STATE}" = "success" ]; then
             newer_failure=$(
               gh api --paginate "repos/${{ github.repository }}/commits/${HEAD_SHA}/statuses" \
@@ -934,10 +912,10 @@ jobs:
                     [ .[] | .[]
                       | select(.context == "codex-review")
                       | select(.state == "failure")
-                      | select($t == "" or .created_at >= $t) ] | length'
+                      | select($t == "" or .created_at > $t) ] | length'
             )
             if [ "${newer_failure}" -gt 0 ]; then
-              echo "Refusing to post success on ${HEAD_SHA}: a codex-review failure was recorded at or after this run read its evidence (snapshot ${SNAPSHOT_AT}). Leaving the newer verdict in place."
+              echo "Refusing to post success on ${HEAD_SHA}: a codex-review failure was recorded after this run read its evidence (snapshot ${SNAPSHOT_AT}). Leaving the newer verdict in place."
               exit 0
             fi
           fi
