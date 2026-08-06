@@ -532,8 +532,15 @@ jobs:
           PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
           ACK_TIME: ${{ steps.override.outputs.ack_time }}
+          PRIOR: ${{ steps.override.outputs.prior }}
         run: |
           set -euo pipefail
+
+          # Stamped BEFORE any evidence is read, so it is a lower bound on
+          # how fresh this run's snapshot is. The post step uses it to
+          # refuse to overwrite a failure that was decided after we looked.
+          snapshot_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          echo "snapshot_at=${snapshot_at}" >> "$GITHUB_OUTPUT"
 
           # Codex renders every finding with a shields.io severity badge:
           #   **<sub><sub>![P1 Badge](https://img.shields.io/badge/P1-orange?style=flat)</sub></sub>  Title**
@@ -575,6 +582,7 @@ jobs:
               --arg sha "$HEAD_SHA" \
               --arg short "${HEAD_SHA:0:10}" \
               --arg ack "${ACK_TIME:-}" \
+              --arg prior "${PRIOR:-none}" \
               --arg blocking "$BLOCKING" \
               --arg classified "$CLASSIFIED" \
               --arg shape "$SHAPE" '
@@ -597,16 +605,37 @@ jobs:
                   and ((.pull_request_review_id) as $p | $ids | index($p)) != null
                 ))) as $fx
 
-              # Comment-path review: the newest Codex-Review-shaped issue
-              # comment that does not name a DIFFERENT commit. Codex states
-              # "Reviewed commit: <short>" when it knows it; when it does
-              # not, the comment is still admissible because a status is
-              # only ever posted once review of this SHA was established.
+              # Comment-path review. Codex usually states
+              # "Reviewed commit: <short>", which binds the comment to a
+              # SHA outright. Two buckets, because they are NOT equally
+              # trustworthy:
+              #
+              #   $cm_bound   — names THIS head. Self-binding, always safe.
+              #   $cm_untagged — names no commit at all. Admissible ONLY as
+              #     re-grading evidence for a SHA the gate already accepted
+              #     a review for (see $prior below).
+              #
+              # An earlier cut accepted untagged comments unconditionally.
+              # That broke the latency gate outright: after a force-push to
+              # an unreviewed SHA B, the old untagged comment still matched,
+              # graded=1, and the verdict could post success on a commit
+              # Codex had never seen. Codex P1 across 12 of the rollout PRs,
+              # and correct — the approval step rejects that case, but its
+              # result was not consulted here. Comments naming a DIFFERENT
+              # commit fall into neither bucket and are simply ignored.
               | ([ $issues[]
                    | select(.user.login == bot)
                    | select(.body | test($shape))
-                   | select((.body | test("Reviewed commit:") | not) or (.body | contains($short)))
-                 ] | sort_by(.created_at) | last) as $cm
+                   | select(.body | contains($short))
+                 ] | sort_by(.created_at) | last) as $cm_bound
+              | ([ $issues[]
+                   | select(.user.login == bot)
+                   | select(.body | test($shape))
+                   | select(.body | test("Reviewed commit:") | not)
+                 ] | sort_by(.created_at) | last) as $cm_untagged
+              | (if $cm_bound != null then $cm_bound
+                 elif $prior != "none" then $cm_untagged
+                 else null end) as $cm
 
               # One flat finding list: {ts, body, inline}. Review bodies and
               # the comment body count as one finding each; inline comments
@@ -620,7 +649,15 @@ jobs:
 
               # Live = not covered by the ack. An ack dismisses only what
               # existed when it was applied, so a later review still blocks.
-              | ( $all | map(select($ack == "" or .ts > $ack)) ) as $live
+              #
+              # >= not >, deliberately. GitHub truncates timestamps to whole
+              # seconds, so a review landing in the SAME second as the label
+              # is unorderable — and under > it was silently treated as
+              # acknowledged, letting a brand new P0/P1 post success. Equal
+              # time therefore stays LIVE. Same doctrine as the strict < on
+              # the push/mention comparison above: unverifiable ordering
+              # resolves against the merge, never toward it. Codex P1.
+              | ( $all | map(select($ack == "" or .ts >= $ack)) ) as $live
 
               | [ (if (($rv | length) > 0 or $cm != null) then 1 else 0 end),
                   ( [ $all[]  | select(.body | test($blocking)) ] | length ),
@@ -709,8 +746,39 @@ jobs:
           PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
           STATE: ${{ steps.verdict.outputs.state }}
           DESCRIPTION: ${{ steps.verdict.outputs.description }}
+          SNAPSHOT_AT: ${{ steps.severity.outputs.snapshot_at }}
         run: |
           set -euo pipefail
+
+          # LAST-WRITER GUARD. Event types are separate concurrency groups
+          # (the group key includes github.event_name), so a slow
+          # pull_request_target run can still be in flight when a
+          # pull_request_review run posts `failure` for a review that
+          # landed after we read our evidence. Without this, the slow run
+          # posts its stale `success` last and the P0/P1 goes green.
+          #
+          # This is not hypothetical: it is exactly how eva-chen#30 merged
+          # with a live P1 — the base copy of this workflow posted success
+          # over the head copy's failure at 05:04:51 and auto-merge fired
+          # three seconds later. Codex P1 across the rollout PRs.
+          #
+          # Only `success` is held back. A `failure` may always overwrite,
+          # because erring toward blocking is the safe direction, and a
+          # missing/incorrect block is visible where a false green is not.
+          if [ "${STATE}" = "success" ]; then
+            newer_failure=$(
+              gh api --paginate "repos/${{ github.repository }}/commits/${HEAD_SHA}/statuses" \
+                | jq -s -r --arg t "${SNAPSHOT_AT:-}" '
+                    [ .[] | .[]
+                      | select(.context == "codex-review")
+                      | select(.state == "failure")
+                      | select($t == "" or .created_at > $t) ] | length'
+            )
+            if [ "${newer_failure}" -gt 0 ]; then
+              echo "Refusing to post success on ${HEAD_SHA}: a codex-review failure was recorded after this run read its evidence (snapshot ${SNAPSHOT_AT}). Leaving the newer verdict in place."
+              exit 0
+            fi
+          fi
 
           # Only post when Codex has actually reviewed this commit.
           # Skipping the `pending` post entirely eliminates the race where
