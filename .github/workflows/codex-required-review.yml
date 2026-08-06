@@ -532,8 +532,15 @@ jobs:
           PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
           ACK_TIME: ${{ steps.override.outputs.ack_time }}
+          PRIOR: ${{ steps.override.outputs.prior }}
         run: |
           set -euo pipefail
+
+          # Stamped BEFORE any evidence is read, so it is a lower bound on
+          # how fresh this run's snapshot is. The post step uses it to
+          # refuse to overwrite a failure that was decided after we looked.
+          snapshot_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          echo "snapshot_at=${snapshot_at}" >> "$GITHUB_OUTPUT"
 
           # Codex renders every finding with a shields.io severity badge:
           #   **<sub><sub>![P1 Badge](https://img.shields.io/badge/P1-orange?style=flat)</sub></sub>  Title**
@@ -563,50 +570,182 @@ jobs:
           # Same Codex-Review prefix shapes the comment path already trusts.
           SHAPE='(^|\n)[[:space:]]*(#{1,3}[[:space:]]*(💡[[:space:]]*)?)?Codex Review([[:space:]]|:|$)'
 
-          reviews_json=$(gh api --paginate "repos/${{ github.repository }}/pulls/${PR_NUMBER}/reviews" | jq -s '[.[] | .[]]')
-          comments_json=$(gh api --paginate "repos/${{ github.repository }}/pulls/${PR_NUMBER}/comments" | jq -s '[.[] | .[]]')
-          issue_json=$(gh api --paginate "repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" | jq -s '[.[] | .[]]')
+          # Payloads go to FILES, not argv. `--argjson` puts the whole JSON
+          # body in a single command-line argument, and Linux caps ONE
+          # argument at MAX_ARG_STRLEN = 32 * PAGE_SIZE = 131072 bytes. That
+          # cap is compiled into the kernel, is not raised by ARG_MAX, and is
+          # identical on GitHub's ubuntu runners. A PR that accumulates enough
+          # Codex inline comments crosses it and the step dies with
+          # `jq: Argument list too long`, exit 1 — which kills the job before
+          # any status is posted, so the PR is blocked on a MISSING required
+          # check with no admin override (enforce_admins) and no break-glass
+          # (this step runs before "Decide status to post").
+          #
+          # Not theoretical. Reproduced twice on GitHub's own runner, on this
+          # PR, with this file:
+          #   run 31073500875 (head b261a169)  jq: Argument list too long
+          #   run 31073645115 (head 4fdc9ef7)  jq: Argument list too long
+          #   measured payload: pulls/39/comments = 195702 bytes > 131072
+          # The failure mode is worse the more review activity a PR has, so it
+          # hits the PRs that need the gate most.
+          #
+          # `--slurpfile` reads from a file and has no size limit. Transport
+          # only: the jq program below is unchanged apart from the three
+          # `[0]` unwraps, because --slurpfile binds an ARRAY OF the file's
+          # values while --argjson bound the value itself.
+          gh api --paginate "repos/${{ github.repository }}/pulls/${PR_NUMBER}/reviews"  | jq -s '[.[] | .[]]' > "${RUNNER_TEMP:-/tmp}/codex-reviews.json"
+          gh api --paginate "repos/${{ github.repository }}/pulls/${PR_NUMBER}/comments" | jq -s '[.[] | .[]]' > "${RUNNER_TEMP:-/tmp}/codex-comments.json"
+          gh api --paginate "repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" | jq -s '[.[] | .[]]' > "${RUNNER_TEMP:-/tmp}/codex-issues.json"
+
+          # THREAD PERSISTENCE (SAN-315). Inline findings are sourced from
+          # review THREADS, not from the current head's review.
+          #
+          # Why: binding inline findings to `commit_id == head` drops every
+          # finding the moment an unrelated push moves the head, and Codex
+          # does not re-post a finding it has already filed. The next clean
+          # review then reports success over a P1 nobody fixed.
+          #
+          # Not theoretical — this fired on martin#39 at 05:30:16:
+          #   codex-review = success "Codex reviewed this commit - no P0/P1"
+          #   mergeStateStatus = CLEAN
+          #   ...while 2 unresolved, non-outdated Codex P1 threads were open
+          #      (filed against b261a169 and 4fdc9ef7, neither fixed nor
+          #      dismissed). That is the exact shape SAN-314 exists to close,
+          #      produced by this gate, on the PR that ships it.
+          #
+          # isOutdated is the right freshness signal: GitHub sets it exactly
+          # when the hunk a finding anchors to is gone, which is what "fixed"
+          # looks like. isResolved is the human dismissal. So a finding stops
+          # blocking when it is fixed or explicitly resolved -- never merely
+          # because someone pushed.
+          #
+          # Review BODIES stay head-bound on purpose: a body-stated finding
+          # has no thread, therefore no resolve affordance, so persisting it
+          # would wedge the PR with no dismissal path short of the ack. A
+          # fresh review supersedes the old body. Inline findings have a
+          # thread and therefore have a dismissal path, so they persist.
+          gh api graphql --paginate -f query='
+          query($owner:String!,$name:String!,$pr:Int!,$endCursor:String){
+            repository(owner:$owner,name:$name){
+              pullRequest(number:$pr){
+                reviewThreads(first:100, after:$endCursor){
+                  pageInfo{ hasNextPage endCursor }
+                  nodes{
+                    isResolved isOutdated
+                    comments(first:20){nodes{ author{login} body createdAt }}
+                  }
+                }
+              }
+            }
+          }' -F owner="${{ github.repository_owner }}" \
+             -F name="${{ github.event.repository.name }}" \
+             -F pr="${PR_NUMBER}" \
+            | jq -s '[ .[].data.repository.pullRequest.reviewThreads.nodes[] ]' \
+            > "${RUNNER_TEMP:-/tmp}/codex-threads.json"
 
           read -r graded blocking_total unclassified_total blocking_live unclassified_live < <(
             jq -n -r \
-              --argjson reviews "$reviews_json" \
-              --argjson comments "$comments_json" \
-              --argjson issues "$issue_json" \
+              --slurpfile reviews_f "${RUNNER_TEMP:-/tmp}/codex-reviews.json" \
+              --slurpfile comments_f "${RUNNER_TEMP:-/tmp}/codex-comments.json" \
+              --slurpfile issues_f "${RUNNER_TEMP:-/tmp}/codex-issues.json" \
+              --slurpfile threads_f "${RUNNER_TEMP:-/tmp}/codex-threads.json" \
               --arg sha "$HEAD_SHA" \
               --arg short "${HEAD_SHA:0:10}" \
               --arg ack "${ACK_TIME:-}" \
+              --arg prior "${PRIOR:-none}" \
               --arg blocking "$BLOCKING" \
               --arg classified "$CLASSIFIED" \
               --arg shape "$SHAPE" '
               def bot: "chatgpt-codex-connector[bot]";
 
+              # --slurpfile wraps each file in an outer array; unwrap so the
+              # rest of this program sees exactly what --argjson gave it.
+              ($reviews_f[0]) as $reviews
+              | ($comments_f[0]) as $comments
+              | ($issues_f[0]) as $issues
+              | ($threads_f[0]) as $threads
+
               # Formal reviews Codex submitted against THIS head SHA.
-              ($reviews | map(select(.user.login == bot and .commit_id == $sha))) as $rv
-              | ($rv | map(.id)) as $ids
-              | ($rv | map({key: (.id | tostring), value: .submitted_at}) | from_entries) as $ts
+              | ($reviews | map(select(.user.login == bot and .commit_id == $sha))) as $rv
+              # Inline findings come from review THREADS that are not
+              # OUTDATED, whatever head raised them. See the note above the
+              # GraphQL query for why this is deliberately not bound to the
+              # head SHA.
+              #
+              # isResolved is deliberately NOT a dismissal. GitHub lets the
+              # PR OPENER resolve conversations on their own PR, so treating
+              # resolution as authorisation hands an untrusted contributor a
+              # self-serve bypass: resolve the thread, post any PR comment to
+              # re-trigger issue_comment, and the failure flips to success
+              # with no code change and no codex-p1-ack. That bypass is wider
+              # here than elsewhere precisely because this repo relaxed the
+              # job-level if: so that any PR comment re-runs the job.
+              #
+              # So there is exactly ONE dismissal path -- the codex-p1-ack
+              # label, which needs write access to apply, is anti-bypassed
+              # (it only downgrades a verdict that already exists), is scoped
+              # by time so it cannot auto-green a later finding, and names
+              # its actor in the status description. A finding otherwise
+              # stops blocking only when it is genuinely fixed, which is what
+              # isOutdated means: GitHub sets it exactly when the hunk the
+              # finding anchors to is gone.
+              #
+              # The reviewer asked for "trusted actor OR the acknowledgement
+              # path". Dropping isResolved is the stricter superset, and it
+              # avoids a per-resolver permission lookup that would itself
+              # need a failure mode.
+              #
+              # The finding is the FIRST Codex comment in the thread; later
+              # comments are conversational replies, which are not findings
+              # and would otherwise trip the unclassified guard (the job the
+              # old in_reply_to_id filter did).
+              #
+              # Login is compared EXACTLY. GraphQL spells it
+              # chatgpt-codex-connector with NO [bot] suffix, unlike every
+              # REST query in this file -- matching the REST spelling counts
+              # zero and passes everything. A prefix test is not good enough
+              # either: on a public PR any account whose login merely STARTS
+              # with that string could inject threads. Verified against this
+              # PR: 12/12 Codex thread comments have login exactly
+              # chatgpt-codex-connector.
+              | ($threads
+                 | map(select(.isOutdated == false))
+                 | map(.comments.nodes
+                       | map(select((.author.login // "") == "chatgpt-codex-connector"))
+                       | first)
+                 | map(select(. != null))) as $fx
 
-              # Findings = top-level inline comments belonging to those
-              # reviews. Anchoring on pull_request_review_id (not the
-              # comment commit_id) keeps a finding tied to the review that
-              # raised it, so a fixed + re-reviewed SHA starts clean.
-              # in_reply_to_id == null drops conversational replies, which
-              # are not findings and would trip the unclassified guard.
-              | ($comments | map(select(
-                  .user.login == bot
-                  and .in_reply_to_id == null
-                  and ((.pull_request_review_id) as $p | $ids | index($p)) != null
-                ))) as $fx
-
-              # Comment-path review: the newest Codex-Review-shaped issue
-              # comment that does not name a DIFFERENT commit. Codex states
-              # "Reviewed commit: <short>" when it knows it; when it does
-              # not, the comment is still admissible because a status is
-              # only ever posted once review of this SHA was established.
+              # Comment-path review. Codex usually states
+              # "Reviewed commit: <short>", which binds the comment to a
+              # SHA outright. Two buckets, because they are NOT equally
+              # trustworthy:
+              #
+              #   $cm_bound   — names THIS head. Self-binding, always safe.
+              #   $cm_untagged — names no commit at all. Admissible ONLY as
+              #     re-grading evidence for a SHA the gate already accepted
+              #     a review for (see $prior below).
+              #
+              # An earlier cut accepted untagged comments unconditionally.
+              # That broke the latency gate outright: after a force-push to
+              # an unreviewed SHA B, the old untagged comment still matched,
+              # graded=1, and the verdict could post success on a commit
+              # Codex had never seen. Codex P1 across 12 of the rollout PRs,
+              # and correct — the approval step rejects that case, but its
+              # result was not consulted here. Comments naming a DIFFERENT
+              # commit fall into neither bucket and are simply ignored.
               | ([ $issues[]
                    | select(.user.login == bot)
                    | select(.body | test($shape))
-                   | select((.body | test("Reviewed commit:") | not) or (.body | contains($short)))
-                 ] | sort_by(.created_at) | last) as $cm
+                   | select(.body | contains($short))
+                 ] | sort_by(.created_at) | last) as $cm_bound
+              | ([ $issues[]
+                   | select(.user.login == bot)
+                   | select(.body | test($shape))
+                   | select(.body | test("Reviewed commit:") | not)
+                 ] | sort_by(.created_at) | last) as $cm_untagged
+              | (if $cm_bound != null then $cm_bound
+                 elif $prior != "none" then $cm_untagged
+                 else null end) as $cm
 
               # One flat finding list: {ts, body, inline}. Review bodies and
               # the comment body count as one finding each; inline comments
@@ -614,13 +753,21 @@ jobs:
               # that raised them. No apostrophes below this line: the jq
               # program is bash single-quoted, so one would end it early.
               | ( [ $rv[]  | {ts: .submitted_at, body: (.body // ""), inline: false} ]
-                + [ $fx[]  | {ts: ($ts[(.pull_request_review_id | tostring)] // ""), body: (.body // ""), inline: true} ]
+                + [ $fx[]  | {ts: (.createdAt // ""), body: (.body // ""), inline: true} ]
                 + (if $cm == null then [] else [ {ts: $cm.created_at, body: ($cm.body // ""), inline: false} ] end)
                 ) as $all
 
               # Live = not covered by the ack. An ack dismisses only what
               # existed when it was applied, so a later review still blocks.
-              | ( $all | map(select($ack == "" or .ts > $ack)) ) as $live
+              #
+              # >= not >, deliberately. GitHub truncates timestamps to whole
+              # seconds, so a review landing in the SAME second as the label
+              # is unorderable — and under > it was silently treated as
+              # acknowledged, letting a brand new P0/P1 post success. Equal
+              # time therefore stays LIVE. Same doctrine as the strict < on
+              # the push/mention comparison above: unverifiable ordering
+              # resolves against the merge, never toward it. Codex P1.
+              | ( $all | map(select($ack == "" or .ts >= $ack)) ) as $live
 
               | [ (if (($rv | length) > 0 or $cm != null) then 1 else 0 end),
                   ( [ $all[]  | select(.body | test($blocking)) ] | length ),
@@ -709,8 +856,39 @@ jobs:
           PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
           STATE: ${{ steps.verdict.outputs.state }}
           DESCRIPTION: ${{ steps.verdict.outputs.description }}
+          SNAPSHOT_AT: ${{ steps.severity.outputs.snapshot_at }}
         run: |
           set -euo pipefail
+
+          # LAST-WRITER GUARD. Event types are separate concurrency groups
+          # (the group key includes github.event_name), so a slow
+          # pull_request_target run can still be in flight when a
+          # pull_request_review run posts `failure` for a review that
+          # landed after we read our evidence. Without this, the slow run
+          # posts its stale `success` last and the P0/P1 goes green.
+          #
+          # This is not hypothetical: it is exactly how eva-chen#30 merged
+          # with a live P1 — the base copy of this workflow posted success
+          # over the head copy's failure at 05:04:51 and auto-merge fired
+          # three seconds later. Codex P1 across the rollout PRs.
+          #
+          # Only `success` is held back. A `failure` may always overwrite,
+          # because erring toward blocking is the safe direction, and a
+          # missing/incorrect block is visible where a false green is not.
+          if [ "${STATE}" = "success" ]; then
+            newer_failure=$(
+              gh api --paginate "repos/${{ github.repository }}/commits/${HEAD_SHA}/statuses" \
+                | jq -s -r --arg t "${SNAPSHOT_AT:-}" '
+                    [ .[] | .[]
+                      | select(.context == "codex-review")
+                      | select(.state == "failure")
+                      | select($t == "" or .created_at > $t) ] | length'
+            )
+            if [ "${newer_failure}" -gt 0 ]; then
+              echo "Refusing to post success on ${HEAD_SHA}: a codex-review failure was recorded after this run read its evidence (snapshot ${SNAPSHOT_AT}). Leaving the newer verdict in place."
+              exit 0
+            fi
+          fi
 
           # Only post when Codex has actually reviewed this commit.
           # Skipping the `pending` post entirely eliminates the race where
