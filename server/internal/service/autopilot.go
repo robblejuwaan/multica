@@ -45,6 +45,12 @@ const DefaultAutopilotTriggerTimezone = "UTC"
 
 const autopilotRecentDuplicateWindow = 60 * time.Second
 
+// activeAutopilotRunRecoverySecs bounds an orphaned admission row that never
+// linked a downstream task (for example, a process crash after INSERT). Runs
+// with a live task are protected by that task's existing daemon liveness and
+// retry recovery, so healthy long-running work never expires on this timer.
+const activeAutopilotRunRecoverySecs = 5 * 60
+
 func NewAutopilotService(q *db.Queries, tx TxStarter, bus *events.Bus, taskSvc *TaskService) *AutopilotService {
 	return &AutopilotService{Queries: q, TxStarter: tx, Bus: bus, TaskSvc: taskSvc}
 }
@@ -193,25 +199,16 @@ func (s *AutopilotService) AdmitAutopilotWebhookDelivery(
 		return run, nil
 	}
 
-	initialStatus := "issue_created"
-	if autopilot.ExecutionMode == "run_only" {
-		initialStatus = "running"
-	}
-	run, err := s.Queries.CreateAutopilotRun(ctx, db.CreateAutopilotRunParams{
-		AutopilotID:       autopilot.ID,
-		TriggerID:         triggerID,
-		Source:            "webhook",
-		Status:            initialStatus,
-		TriggerPayload:    payload,
-		SquadID:           autopilotSquadAttribution(autopilot),
-		WebhookDeliveryID: deliveryID,
-	})
+	run, _, err := s.createAutopilotRunWithAdmissionLock(ctx, autopilot, triggerID, "webhook", payload, pgtype.Timestamptz{}, deliveryID)
 	if err != nil {
 		return s.recoverConcurrentWebhookAdmission(
 			ctx,
 			deliveryID,
 			fmt.Errorf("admit webhook delivery: create run: %w", err),
 		)
+	}
+	if run.Status == "skipped" {
+		return &run, nil
 	}
 	s.captureAutopilotRunStarted(autopilot, run, "webhook")
 	return &run, nil
@@ -468,7 +465,37 @@ func (s *AutopilotService) dispatchAutopilot(
 		return run, code, err
 	}
 
-	// Determine initial status based on execution mode.
+	run, reused, err := s.createAutopilotRunWithAdmissionLock(ctx, autopilot, triggerID, source, payload, plannedAt, webhookDeliveryID)
+	if err != nil {
+		return nil, dispatch.ReasonInternalError, err
+	}
+	if reused {
+		return &run, "", nil
+	}
+	if run.Status == "skipped" {
+		return &run, dispatch.ReasonAlreadyActive, nil
+	}
+	s.captureAutopilotRunStarted(autopilot, run, source)
+	return s.dispatchAutopilotRun(ctx, autopilot, triggerID, source, &run, actorUserID)
+}
+
+// createAutopilotRunWithAdmissionLock creates the active run guarded by
+// uq_autopilot_run_one_active_per_autopilot. The unique index, rather than a
+// read-before-write check, is the authoritative cross-replica lock. A loser
+// records a terminal skipped run with the winning run ID for human inspection.
+//
+// A same-planned-occurrence collision is different: it is scheduler retry
+// idempotency, not contention. Return the existing occurrence untouched so a
+// retry never creates a spurious skipped run.
+func (s *AutopilotService) createAutopilotRunWithAdmissionLock(
+	ctx context.Context,
+	autopilot db.Autopilot,
+	triggerID pgtype.UUID,
+	source string,
+	payload []byte,
+	plannedAt pgtype.Timestamptz,
+	webhookDeliveryID pgtype.UUID,
+) (db.AutopilotRun, bool, error) {
 	initialStatus := "issue_created"
 	if autopilot.ExecutionMode == "run_only" {
 		initialStatus = "running"
@@ -484,11 +511,76 @@ func (s *AutopilotService) dispatchAutopilot(
 		PlannedAt:         plannedAt,
 		WebhookDeliveryID: webhookDeliveryID,
 	})
-	if err != nil {
-		return nil, dispatch.ReasonInternalError, fmt.Errorf("create run: %w", err)
+	if err == nil {
+		return run, false, nil
 	}
-	s.captureAutopilotRunStarted(autopilot, run, source)
-	return s.dispatchAutopilotRun(ctx, autopilot, triggerID, source, &run, actorUserID)
+
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != "23505" {
+		return db.AutopilotRun{}, false, fmt.Errorf("create run: %w", err)
+	}
+
+	if webhookDeliveryID.Valid {
+		existing, lookupErr := s.Queries.GetAutopilotRunByWebhookDelivery(ctx, webhookDeliveryID)
+		if lookupErr == nil {
+			return existing, true, nil
+		}
+		if !errors.Is(lookupErr, pgx.ErrNoRows) {
+			return db.AutopilotRun{}, false, fmt.Errorf("reload webhook run after conflict: %w", lookupErr)
+		}
+	}
+
+	if plannedAt.Valid && triggerID.Valid {
+		existing, lookupErr := s.Queries.GetAutopilotRunByTriggerAndPlanned(ctx, db.GetAutopilotRunByTriggerAndPlannedParams{
+			TriggerID: triggerID,
+			PlannedAt: plannedAt,
+		})
+		if lookupErr == nil {
+			return existing, true, nil
+		}
+		if !errors.Is(lookupErr, pgx.ErrNoRows) {
+			return db.AutopilotRun{}, false, fmt.Errorf("reload same planned run after conflict: %w", lookupErr)
+		}
+	}
+
+	holder, lookupErr := s.Queries.GetActiveAutopilotRun(ctx, autopilot.ID)
+	if lookupErr != nil {
+		return db.AutopilotRun{}, false, fmt.Errorf("find active run after contention: %w", lookupErr)
+	}
+	if _, recoveryErr := s.Queries.RecoverStaleAutopilotRunWithoutActiveTask(ctx, db.RecoverStaleAutopilotRunWithoutActiveTaskParams{
+		ID:           holder.ID,
+		RecoverySecs: activeAutopilotRunRecoverySecs,
+	}); recoveryErr == nil {
+		slog.Warn("recovered stale autopilot admission holder without active task",
+			"autopilot_id", util.UUIDToString(autopilot.ID),
+			"run_id", util.UUIDToString(holder.ID),
+		)
+		return s.createAutopilotRunWithAdmissionLock(ctx, autopilot, triggerID, source, payload, plannedAt, webhookDeliveryID)
+	} else if !errors.Is(recoveryErr, pgx.ErrNoRows) {
+		return db.AutopilotRun{}, false, fmt.Errorf("recover stale active run after contention: %w", recoveryErr)
+	}
+	reason := fmt.Sprintf("skipped: another autopilot run is active (run %s)", util.UUIDToString(holder.ID))
+	skipped, skipErr := s.recordSkippedRun(ctx, autopilot, triggerID, source, payload, plannedAt, webhookDeliveryID, reason)
+	if skipErr != nil {
+		return db.AutopilotRun{}, false, fmt.Errorf("record active-run contention skip: %w", skipErr)
+	}
+	result, marshalErr := json.Marshal(map[string]string{
+		"status":        "skipped",
+		"reason":        reason,
+		"active_run_id": util.UUIDToString(holder.ID),
+	})
+	if marshalErr != nil {
+		return db.AutopilotRun{}, false, fmt.Errorf("marshal active-run contention result: %w", marshalErr)
+	}
+	updated, updateErr := s.Queries.UpdateAutopilotRunSkippedWithResult(ctx, db.UpdateAutopilotRunSkippedWithResultParams{
+		ID:            skipped.ID,
+		FailureReason: pgtype.Text{String: reason, Valid: true},
+		Result:        result,
+	})
+	if updateErr != nil {
+		return db.AutopilotRun{}, false, fmt.Errorf("store active-run contention result: %w", updateErr)
+	}
+	return updated, false, nil
 }
 
 // dispatchAutopilotRun performs the downstream side effect for an already
