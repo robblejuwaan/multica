@@ -3,11 +3,13 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/events"
 	"github.com/multica-ai/multica/server/internal/util"
@@ -160,6 +162,19 @@ func TestAutopilotActiveRunLock(t *testing.T) {
 	task, err := q.GetAutopilotTaskByRun(ctx, util.MustParseUUID(activeID))
 	if err != nil {
 		t.Fatalf("load holder task: %v", err)
+	}
+	// A deferred retry is still live work. In particular, it can wait longer
+	// than the orphan admission timeout, so recovery must not steal its lock.
+	if _, err := pool.Exec(ctx, `UPDATE agent_task_queue SET status = 'deferred', fire_at = now() + interval '1 hour' WHERE id = $1`, task.ID); err != nil {
+		t.Fatalf("defer holder task: %v", err)
+	}
+	if _, err := q.RecoverStaleAutopilotRunWithoutActiveTask(ctx, db.RecoverStaleAutopilotRunWithoutActiveTaskParams{
+		ID: util.MustParseUUID(activeID), RecoverySecs: 0,
+	}); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("deferred holder was recoverable: err=%v, want no rows", err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE agent_task_queue SET status = 'running', fire_at = NULL WHERE id = $1`, task.ID); err != nil {
+		t.Fatalf("restore holder task: %v", err)
 	}
 	if _, err := pool.Exec(ctx, `UPDATE agent_task_queue SET status = 'failed', completed_at = now(), error = 'daemon killed', failure_reason = 'runtime_recovery' WHERE id = $1`, task.ID); err != nil {
 		t.Fatalf("simulate killed holder: %v", err)

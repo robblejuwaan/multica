@@ -552,7 +552,7 @@ func (q *Queries) GetActiveAutopilotRuleVersion(ctx context.Context, arg GetActi
 const getActiveAutopilotRun = `-- name: GetActiveAutopilotRun :one
 SELECT id, autopilot_id, trigger_id, source, status, issue_id, task_id, triggered_at, completed_at, failure_reason, trigger_payload, result, created_at, squad_id, planned_at, webhook_delivery_id FROM autopilot_run
 WHERE autopilot_id = $1
-  AND status IN ('pending', 'issue_created', 'running')
+  AND status IN ('issue_created', 'running')
 ORDER BY created_at ASC
 LIMIT 1
 `
@@ -1348,13 +1348,13 @@ SET status = 'failed',
     completed_at = now(),
     failure_reason = 'stale active run recovered: no active downstream task'
 WHERE r.id = $1
-  AND r.status IN ('pending', 'issue_created', 'running')
+  AND r.status IN ('issue_created', 'running')
   AND r.triggered_at < now() - make_interval(secs => $2::double precision)
   AND NOT EXISTS (
       SELECT 1
       FROM agent_task_queue t
       WHERE (t.id = r.task_id OR (r.issue_id IS NOT NULL AND t.issue_id = r.issue_id))
-        AND t.status IN ('queued', 'dispatched', 'waiting_local_directory', 'running')
+        AND t.status IN ('queued', 'dispatched', 'waiting_local_directory', 'running', 'deferred')
   )
 RETURNING r.id, r.autopilot_id, r.trigger_id, r.source, r.status, r.issue_id, r.task_id, r.triggered_at, r.completed_at, r.failure_reason, r.trigger_payload, r.result, r.created_at, r.squad_id, r.planned_at, r.webhook_delivery_id
 `

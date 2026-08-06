@@ -302,7 +302,7 @@ WHERE id = $1;
 -- human can see exactly why this occurrence did not start.
 SELECT * FROM autopilot_run
 WHERE autopilot_id = $1
-  AND status IN ('pending', 'issue_created', 'running')
+  AND status IN ('issue_created', 'running')
 ORDER BY created_at ASC
 LIMIT 1;
 
@@ -317,13 +317,13 @@ SET status = 'failed',
     completed_at = now(),
     failure_reason = 'stale active run recovered: no active downstream task'
 WHERE r.id = $1
-  AND r.status IN ('pending', 'issue_created', 'running')
+  AND r.status IN ('issue_created', 'running')
   AND r.triggered_at < now() - make_interval(secs => @recovery_secs::double precision)
   AND NOT EXISTS (
       SELECT 1
       FROM agent_task_queue t
       WHERE (t.id = r.task_id OR (r.issue_id IS NOT NULL AND t.issue_id = r.issue_id))
-        AND t.status IN ('queued', 'dispatched', 'waiting_local_directory', 'running')
+        AND t.status IN ('queued', 'dispatched', 'waiting_local_directory', 'running', 'deferred')
   )
 RETURNING r.*;
 

@@ -694,6 +694,53 @@ func TestWebhookDeliveryWorker_DispatchesRunAdmittedBeforePause(t *testing.T) {
 	}
 }
 
+func TestWebhookHandler_ActiveRunDefersDeliveryForRetry(t *testing.T) {
+	agentID := createWebhookTestAgent(t, "Active Run Webhook Agent")
+	apID := createWebhookTestAutopilot(t, agentID, "active", "run_only")
+	trig := createWebhookTriggerViaHandler(t, apID)
+
+	first := postWebhook(t, *trig.WebhookToken, map[string]any{"event": "active.first"}, nil)
+	firstDeliveryID := requireAcceptedWebhookResponse(t, first)
+	second := postWebhook(t, *trig.WebhookToken, map[string]any{"event": "active.second"}, nil)
+	if second.Code != http.StatusConflict {
+		t.Fatalf("contended webhook status=%d body=%s, want %d", second.Code, second.Body.String(), http.StatusConflict)
+	}
+	var response map[string]any
+	if err := json.Unmarshal(second.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode deferred webhook response: %v", err)
+	}
+	if response["status"] != "deferred" || response["reason"] != "another_autopilot_run_active" {
+		t.Fatalf("contended webhook response=%v, want deferred active-run reason", response)
+	}
+	secondDeliveryID, ok := response["delivery_id"].(string)
+	if !ok || secondDeliveryID == "" {
+		t.Fatalf("deferred webhook response missing delivery_id: %v", response)
+	}
+	secondDelivery, err := testHandler.Queries.GetWebhookDelivery(context.Background(), parseUUID(secondDeliveryID))
+	if err != nil {
+		t.Fatalf("load deferred delivery: %v", err)
+	}
+	if secondDelivery.Status != deliveryStatusQueued || secondDelivery.AutopilotRunID.Valid {
+		t.Fatalf("contended delivery was terminalized: status=%s run_id_valid=%v", secondDelivery.Status, secondDelivery.AutopilotRunID.Valid)
+	}
+
+	// Dispatch the holder, then have the durable worker claim the deferred
+	// delivery. Contention must release it back to queued work rather than mark
+	// the webhook terminally skipped/failed.
+	processQueuedWebhookDelivery(t, firstDeliveryID)
+	worked, err := testHandler.WebhookDeliveryWorker.ProcessNext(context.Background())
+	if err != nil || !worked {
+		t.Fatalf("process contended delivery: worked=%v err=%v", worked, err)
+	}
+	secondDelivery, err = testHandler.Queries.GetWebhookDelivery(context.Background(), parseUUID(secondDeliveryID))
+	if err != nil {
+		t.Fatalf("reload retried delivery: %v", err)
+	}
+	if secondDelivery.Status != deliveryStatusQueued || secondDelivery.DispatchAttempts != 1 || !secondDelivery.AvailableAt.Valid {
+		t.Fatalf("contended delivery was not retryable: status=%s attempts=%d available=%v", secondDelivery.Status, secondDelivery.DispatchAttempts, secondDelivery.AvailableAt.Valid)
+	}
+}
+
 func TestWebhookDeliveryWorker_RecoversExpiredLeaseAndReusesRun(t *testing.T) {
 	agentID := createWebhookTestAgent(t, "WorkerRecovery Agent")
 	apID := createWebhookTestAutopilot(t, agentID, "active", "run_only")

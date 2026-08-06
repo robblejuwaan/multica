@@ -1,0 +1,1 @@
+DROP INDEX CONCURRENTLY IF EXISTS uq_autopilot_run_one_active_per_autopilot;
