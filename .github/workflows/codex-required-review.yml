@@ -174,21 +174,36 @@ on:
   issue_comment:
     types: [created]
 
-# Deduplicate repeats of the SAME event only. pull_request_target and
-# pull_request_review both legitimately run for one SHA — the first looks
-# for an existing Codex review, the second fires when a review lands — so
-# grouping across events could cancel the run that was about to post the
-# status and leave the PR blocked forever.
+# ONE GROUP PER PR, ACROSS ALL EVENT TYPES. Runs serialize instead of
+# racing.
+#
+# This used to be keyed on `github.event_name` as well, which meant a
+# pull_request_review run and an issue_comment run for the SAME PR
+# executed concurrently — two writers to one status with no ordering.
+# That is the class that landed eva-chen#30 with a live P1 at 05:04:54 on
+# 2026-08-06: a stale run posted `success` after a newer run had posted
+# `failure`. The last-writer guard in the post step narrows that window
+# but cannot close it, because a query-to-POST gap remains. Serializing
+# the writers is what actually closes it. Raised in review 2026-08-06 as
+# "fix it or ack it"; this is the fix.
+#
+# WHY DROPPING THE PER-EVENT SPLIT IS NOW SAFE. The original split existed
+# because cancelling across events could kill the one-shot run that was
+# about to post, leaving a reviewed PR blocked forever. Two things changed:
+#   1. cancel-in-progress is FALSE, so nothing in flight is ever cancelled
+#      — later runs queue behind it rather than replacing it.
+#   2. Every run recomputes the entire verdict from durable sources (the
+#      reviews on this head SHA, the newest eligible Codex comment, the
+#      label timeline). No run carries information that a later run cannot
+#      re-derive.
+# Together those mean GitHub's "at most one pending run per group" is
+# harmless here: if a pending run is superseded, its replacement is
+# strictly fresher and reaches the same or a newer verdict. The cost is a
+# few extra pull_request_target runs on rapid pushes, since superseded
+# pushes no longer cancel — cheap next to a false green.
 concurrency:
-  group: codex-review-${{ github.event.pull_request.number || github.event.issue.number }}-${{ github.event_name }}
-  # CANCEL ONLY THE PUSH-DRIVEN PATH. pull_request_target repeats when you push
-  # again, and the older run is genuinely superseded. pull_request_review and
-  # issue_comment are ONE-SHOT events carrying information no later run
-  # reproduces: cancelling them can kill the very run that was about to post
-  # `codex-review`, and the replacement (a human comment, author != the Codex
-  # bot) will not post it — leaving the required check missing forever on a PR
-  # that WAS reviewed. Introduced and caught in review the same day. (Codex P2.)
-  cancel-in-progress: ${{ github.event_name == 'pull_request_target' }}
+  group: codex-review-${{ github.event.pull_request.number || github.event.issue.number }}
+  cancel-in-progress: false
 
 permissions:
   pull-requests: read
@@ -733,19 +748,24 @@ jobs:
               # and correct — the approval step rejects that case, but its
               # result was not consulted here. Comments naming a DIFFERENT
               # commit fall into neither bucket and are simply ignored.
+              # NEWEST ELIGIBLE WINS, evaluated as one pool rather than
+              # bound-then-untagged. The earlier form let a SHA-bound clean
+              # comment take unconditional precedence, so a LATER untagged
+              # response carrying a P0/P1 was never selected and the verdict
+              # could post success over it — the false-PASS direction, and
+              # the same shape as the bug this ticket exists to close. Found
+              # in review 2026-08-06.
+              #
+              # Eligibility, unchanged: a comment naming THIS head is always
+              # admissible; an untagged one only as re-grading evidence for a
+              # SHA the gate already accepted a review for. A comment naming
+              # a DIFFERENT commit is eligible under neither and is ignored.
               | ([ $issues[]
                    | select(.user.login == bot)
                    | select(.body | test($shape))
-                   | select(.body | contains($short))
-                 ] | sort_by(.created_at) | last) as $cm_bound
-              | ([ $issues[]
-                   | select(.user.login == bot)
-                   | select(.body | test($shape))
-                   | select(.body | test("Reviewed commit:") | not)
-                 ] | sort_by(.created_at) | last) as $cm_untagged
-              | (if $cm_bound != null then $cm_bound
-                 elif $prior != "none" then $cm_untagged
-                 else null end) as $cm
+                   | select( (.body | contains($short))
+                             or ((.body | test("Reviewed commit:") | not) and $prior != "none") )
+                 ] | sort_by(.created_at) | last) as $cm
 
               # One flat finding list: {ts, body, inline}. Review bodies and
               # the comment body count as one finding each; inline comments
