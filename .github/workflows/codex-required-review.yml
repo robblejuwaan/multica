@@ -902,6 +902,13 @@ jobs:
           # over the head copy's failure at 05:04:51 and auto-merge fired
           # three seconds later. Codex P1 across the rollout PRs.
           #
+          # >= not >, for the same reason as the ack comparison in the
+          # severity step: GitHub truncates status timestamps to whole
+          # seconds, so a failure recorded in the SAME second this run read
+          # its evidence is unorderable against it. Under > that tie
+          # resolved toward the merge and the success overwrote it. Equal
+          # time now counts as newer, so the tie blocks. (SAN-314.)
+          #
           # Only `success` is held back. A `failure` may always overwrite,
           # because erring toward blocking is the safe direction, and a
           # missing/incorrect block is visible where a false green is not.
@@ -912,10 +919,10 @@ jobs:
                     [ .[] | .[]
                       | select(.context == "codex-review")
                       | select(.state == "failure")
-                      | select($t == "" or .created_at > $t) ] | length'
+                      | select($t == "" or .created_at >= $t) ] | length'
             )
             if [ "${newer_failure}" -gt 0 ]; then
-              echo "Refusing to post success on ${HEAD_SHA}: a codex-review failure was recorded after this run read its evidence (snapshot ${SNAPSHOT_AT}). Leaving the newer verdict in place."
+              echo "Refusing to post success on ${HEAD_SHA}: a codex-review failure was recorded at or after this run read its evidence (snapshot ${SNAPSHOT_AT}). Leaving the newer verdict in place."
               exit 0
             fi
           fi
