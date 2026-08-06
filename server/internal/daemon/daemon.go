@@ -5164,6 +5164,13 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	if checkoutMode := repoCheckoutModeFor(provider, runtime.GOOS); checkoutMode != "" {
 		agentEnv[repoCheckoutModeEnv] = checkoutMode
 	}
+	// Whether this run owns an issue is a fact the run cannot otherwise
+	// establish, and it decides whether the run may take externally-visible
+	// actions: a run-only autopilot has no issue, so it cannot see what another
+	// run is already doing about the same work. Absent means run-only.
+	if task.IssueID != "" {
+		agentEnv["MULTICA_ISSUE_ID"] = task.IssueID
+	}
 	if task.AutopilotRunID != "" {
 		agentEnv["MULTICA_AUTOPILOT_RUN_ID"] = task.AutopilotRunID
 	}
