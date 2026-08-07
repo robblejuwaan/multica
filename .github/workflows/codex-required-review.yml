@@ -101,16 +101,103 @@ name: Codex Required Review
 # BREAK GLASS: a false-positive P1 must not wedge a PR forever. Apply the
 # `codex-p1-ack` label, then comment on the PR to re-check — the comment
 # is what re-runs this workflow, because label events are deliberately not
-# triggers (see above). The status then reads `success` naming who
-# dismissed it, so the act is visible rather than silent.
+# triggers (see above). EVERY acknowledgement must first leave exactly one
+# durable marker in a PR comment (replacing the values):
+#
+#   <!-- codex-p1-ack: actor=Wren Solano; run=<Multica task UUID> -->
+#
+# The marker must be no more than ten minutes before the label and be authored
+# by the same GitHub principal that applied it. The status names the declared
+# actor rather than the shared token owner. Missing, ambiguous, or malformed
+# evidence fails closed: it must never turn a claimed agent action into a green
+# status attributed to the token owner (SAN-321).
+#
+# WHAT THAT MARKER PROVES, EXACTLY (SAN-338). Every Santos agent authenticates
+# to GitHub as the shared token owner, so GitHub cannot tell one actor here
+# from another. The agent marker is therefore a SELF-DECLARATION: it records
+# who says they did it, tied to a Multica run so the claim is checkable
+# out-of-band against that run's log. It is not proof, and the status says
+# `self-declared` so nobody reads it as one.
+#
+# A ROBB ACKNOWLEDGEMENT IS THE ONE CLAIM THAT MUST BE PROVEN, because it is
+# the only one that asserts a human sign-off. Self-declaration is not enough:
+# SAN-321 shipped a manual branch matching `actor=Robb; source=manual` with no
+# second factor, and an agent used it to publish
+# `codex-p1-ack recorded by Robb — no P0/P1` on martin#46 (run 31134005280)
+# with no involvement from Robb at all. It also inverted the incentive — the
+# unattributable path was the cheaper one. So the manual marker now carries an
+# HMAC over the PR it dismisses:
+#
+#   <!-- codex-p1-ack: actor=Robb; source=manual; nonce=<16 hex>; proof=<64 hex> -->
+#
+#   proof = HMAC-SHA256(CODEX_ACK_MANUAL_SECRET,
+#                       "codex-p1-ack:v1:<owner>/<repo>#<pr>:<nonce>")
+#
+# Produce one with `scripts/codex-ack-marker.sh <pr-number>`, which prompts for
+# the secret without echoing it and prints the whole marker line to paste.
+#
+#   - `nonce` is single-use per PR. A proof is public once posted, so without
+#     this, one genuine Robb ack would let anyone re-ack that PR forever by
+#     copying the comment. A nonce seen in more than one comment fails closed.
+#   - The proof deliberately does NOT bind to the head SHA. Binding it there
+#     would invalidate a valid acknowledgement on the next unrelated push and
+#     the path would be abandoned as unusable.
+#   - `actor=Robb` is REJECTED on the run-referenced branch. Otherwise the
+#     forgery just moves house: `actor=Robb; run=<any uuid>` would have
+#     published the same false human sign-off.
+#   - If `CODEX_ACK_MANUAL_SECRET` is unset the manual branch fails closed.
+#     HMAC with an empty key is still a stable hash that anyone can compute,
+#     so an unconfigured secret must never read as a satisfied one.
+#
+# SECRET HANDLING. `CODEX_ACK_MANUAL_SECRET` belongs in this repo's Actions
+# secrets and in Robb's own password store, and NOWHERE ELSE — specifically not
+# in a file, env, or shell history on the box the agents run on, which is where
+# they would simply read it.
+#
+# WHAT THIS DOES NOT CLAIM. The agents' token carries `repo` + `workflow` scope
+# and admin on this repo, so an agent that decides to attack this gate can
+# rewrite it, drop the branch protection, or exfiltrate an Actions secret via a
+# workflow it pushes to any branch. No control that lives inside GitHub survives
+# that, and this one does not pretend to. What it does is remove the CHEAP
+# unattributable path: an agent following its instructions has no proof in hand,
+# so it cannot dismiss a finding as Robb, and the expensive path leaves loud
+# traces. Per-agent GitHub identities with reduced scope remain the real fix
+# (SAN-321 named it; still deferred).
+#
+# ATTRIBUTION IS ONLY PUBLISHED WHERE IT MEANS SOMETHING (SAN-338). A status
+# names an acknowledging actor only when the acknowledgement actually dismissed
+# a finding. With no P0/P1 on the commit the ack did nothing, so the status
+# reports what Codex found and names nobody — the old
+# `codex-p1-ack recorded by <actor> — no P0/P1` wording asserted a sign-off that
+# was neither needed nor verified, and that is the exact string the martin#46
+# forgery published. For the same reason a marker that cannot be validated only
+# blocks when the ack is load-bearing: a leftover label on a clean PR is not a
+# reason to wedge it.
 #
 # The ack is TIME-SCOPED, not a permanent downgrade. It dismisses only
-# findings from reviews submitted BEFORE the label went on. A later Codex
+# findings from reviews submitted BEFORE THE MARKER WAS SIGNED. A later Codex
 # review that raises a NEW P1 blocks again with no further human act.
+#
+# THE MARKER, NOT THE LABEL, IS THE SCOPE (SAN-338). Scoping to the label
+# instead left a first-use gap: an acknowledger signs at T0, a fresh P0/P1
+# lands at T1, and anyone applying the label at T2 inside the ten-minute
+# window gets T1 dismissed as well — a finding that did not exist when the
+# marker was signed, and which the proof therefore says nothing about. Codex
+# P1 on martin#50. Scoping to the marker also means the dismissal covers
+# exactly what the signer could see. An invalid marker scopes NOTHING, so a
+# claim that cannot be validated cannot silence anything either.
 # Without this, one label permanently downgraded the gate for that PR:
 # Codex files more than one review on a single SHA routinely (eva-chen#25
 # has two on 1a581734ec), and the second one's findings were being
 # auto-greened. Found in review, SAN-314.
+#
+# ON THIS REPO THE MANUAL BRANCH IS INERT (SAN-345). No
+# `CODEX_ACK_MANUAL_SECRET` is configured here, so the proven-manual branch
+# fails closed on every input and the only acknowledgement that can go green
+# is an agent's self-declared one. The branch is carried anyway so every gated
+# repo runs ONE reviewed shape, and so enabling a Robb acknowledgement later is
+# a secret rather than another code change behind another Codex-green PR.
+# Whether the manual path survives at all is Robb's open call on SAN-338.
 #
 # WITHDRAWING the ack restores the block. That is not automatic — an
 # earlier cut posted nothing at all on the withdrawal run for a
@@ -475,6 +562,9 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          # Backs the proven-manual branch. Absent on a repo that has not
+          # configured it, which fails that branch closed — see the header.
+          MANUAL_ACK_SECRET: ${{ secrets.CODEX_ACK_MANUAL_SECRET }}
         run: |
           set -euo pipefail
 
@@ -488,24 +578,283 @@ jobs:
           # scopes which findings it covers, the second is what makes a
           # withdrawal restore the block instead of silently leaving green.
           timeline=$(gh api --paginate "repos/${{ github.repository }}/issues/${PR_NUMBER}/timeline" | jq -s '[.[] | .[]]')
-          ack_time=$(printf '%s' "$timeline" | jq -r '[.[] | select(.event == "labeled") | select(.label.name == "codex-p1-ack") | .created_at] | sort | last // ""')
           unack_seen=$(printf '%s' "$timeline" | jq -r '[.[] | select(.event == "unlabeled") | select(.label.name == "codex-p1-ack")] | length')
-          actor=$(printf '%s' "$timeline" | jq -r '[.[] | select(.event == "labeled") | select(.label.name == "codex-p1-ack") | .actor.login] | last // "unknown"')
+          ack_event=$(printf '%s' "$timeline" | jq -c '[.[] | select(.event == "labeled") | select(.label.name == "codex-p1-ack")] | sort_by(.created_at) | last // empty')
+          ack_time=$(printf '%s' "$ack_event" | jq -r '.created_at // ""')
+          label_actor=$(printf '%s' "$ack_event" | jq -r '.actor.login // "unknown"')
+
+          # GitHub records every Santos agent as the shared token owner, so no
+          # label-only acknowledgement is attributable. Every actor therefore
+          # declares itself in a durable, machine-readable PR comment before
+          # applying the label. We deliberately do not look after the label:
+          # that would let a later comment rewrite an acknowledgement's history.
+          #
+          # A malformed marker in the ten-minute acknowledgement window is a
+          # claimed but unverifiable agent action, so keep the gate closed.
+          # A MARKER DIES WITH THE LABEL IT AUTHORISED (SAN-338). The window also
+          # starts after the most recent withdrawal, because counting nonce
+          # re-use across comments does not notice a marker being spent TWICE on
+          # the SAME comment. Without this: remove the label, wait inside the ten
+          # minutes for Codex to file a fresh P0/P1, put the label back. The
+          # original comment still yields nonce_uses == 1 and the public proof
+          # still verifies, while the new and later ack_time scopes away a
+          # finding the acknowledger never saw. Codex P1 on martin#50.
+          #
+          # Strictly after, so an unlabel and a marker in the same UTC second are
+          # unorderable and therefore rejected — the same doctrine as the strict
+          # `<` on the push/mention comparison and the `>=` on the ack scope:
+          # unverifiable ordering resolves against the merge. Re-acknowledging
+          # after a withdrawal means a fresh marker, which is what running
+          # scripts/codex-ack-marker.sh again produces.
+          comments='[]'
+          if [ -n "$ack_time" ]; then
+            marker_window_start=$(date -u -d "${ack_time} - 10 minutes" +%Y-%m-%dT%H:%M:%SZ)
+            last_unack_at=$(printf '%s' "$timeline" | jq -r --arg end "$ack_time" '
+              [ .[]
+                | select(.event == "unlabeled")
+                | select(.label.name == "codex-p1-ack")
+                | select(.created_at <= $end)
+                | .created_at ] | sort | last // ""')
+            comments=$(gh api --paginate "repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" | jq -s '[.[] | .[]]')
+            # AN EDITED COMMENT IS NOT A MARKER. Editing preserves created_at
+            # and only moves updated_at, so every timestamp rule in this step —
+            # the ten-minute window, the withdrawal cutoff, and first
+            # publication of a nonce — reads the time the comment was FIRST
+            # posted, not the time its current text appeared. Without this:
+            # post an empty comment now, wait for a real marker to be published,
+            # edit the old comment to contain a copy of it, and that copy holds
+            # the earlier created_at. That is enough to steal first publication
+            # of somebody else's nonce, and with the label applied inside the
+            # window, to have their proof validated as your acknowledgement.
+            # Found while reviewing this change rather than reported.
+            #
+            # GitHub sets updated_at == created_at on a comment nobody has
+            # edited, so requiring equality rejects the whole class. Cost: a
+            # typo fix on a marker comment invalidates it and needs a fresh
+            # marker, which fails in the safe direction.
+            # STRICTLY BEFORE THE LABEL. GitHub truncates timestamps to whole
+            # seconds, so a marker and a label in the SAME second are unorderable,
+            # and an inclusive comparison resolved that TOWARD the merge: apply a
+            # bare load-bearing label, post a valid marker inside the same second,
+            # and the acknowledgement goes green on evidence that did not exist
+            # when it was made. Same doctrine as the strict `>` on the withdrawal
+            # cutoff below and the `>=` on the ack scope — unverifiable ordering
+            # resolves against the merge, never toward it. Codex P1 on
+            # eva-chen#34, where `labeled` is a workflow trigger and the race is
+            # therefore cheapest. Cost: an acknowledger who labels within a second
+            # of posting the marker must post a fresh one, which fails safe.
+            marker_candidates=$(printf '%s' "$comments" | jq -c --arg start "$marker_window_start" --arg end "$ack_time" --arg label_actor "$label_actor" --arg unack "$last_unack_at" '
+              [ .[]
+                | select(.user.login == $label_actor)
+                | select(.created_at == .updated_at)
+                | select(.created_at >= $start and .created_at < $end)
+                | select($unack == "" or .created_at > $unack)
+                | select(.body | test("<!--\\s*codex-p1-ack\\s*:"))
+              ] | sort_by(.created_at)')
+            if [ -n "$last_unack_at" ]; then
+              echo "codex-p1-ack was withdrawn at ${last_unack_at}; only markers posted after that count for the label at ${ack_time}."
+            fi
+          else
+            marker_candidates='[]'
+          fi
+          marker=$(printf '%s' "$marker_candidates" | jq -c 'last // empty')
+          # OCCURRENCES, NOT COMMENTS. `length` counted candidate COMMENTS, so one
+          # comment carrying two markers passed as a count of 1 and the unanchored
+          # `capture` below then silently picked whichever matched first. Two
+          # markers naming different actors would publish an arbitrary one of
+          # them: ambiguous evidence resolving into a confident attribution, which
+          # is the whole class this gate exists to stop. Counting openings rather
+          # than whole markers is deliberate — a malformed second marker has to
+          # fail the comment too, and it would not match a well-formed pattern.
+          # Codex P1 on santos-brand#5 and multica#4, P2 on eva-chen#34.
+          marker_count=$(printf '%s' "$marker_candidates" | jq '[ .[] | (.body // "") | [ match("<!--\\s*codex-p1-ack\\s*:"; "g") ] | length ] | add // 0')
+          # When the marker was signed. This, not the label event, is what the
+          # dismissal is scoped to — see the header.
+          marker_at=$(printf '%s' "$marker" | jq -r '.created_at // ""')
+          marker_actor=$(printf '%s' "$marker" | jq -r '
+            .body // ""
+            | try capture("<!--\\s*codex-p1-ack\\s*:\\s*actor=(?<actor>[A-Za-z][A-Za-z .-]{0,70});\\s*run=(?<run>[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\\s*-->").actor catch empty')
+          marker_run=$(printf '%s' "$marker" | jq -r '
+            .body // ""
+            | try capture("<!--\\s*codex-p1-ack\\s*:\\s*actor=(?<actor>[A-Za-z][A-Za-z .-]{0,70});\\s*run=(?<run>[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\\s*-->").run catch empty')
+          # The proven-manual shape. `actor=Robb` is baked into the pattern, so a
+          # captured nonce/proof pair IS a well-formed claim to be Robb; whether
+          # the claim holds is decided by the HMAC below.
+          MANUAL_RE='<!--\s*codex-p1-ack\s*:\s*actor=Robb;\s*source=manual;\s*nonce=(?<nonce>[0-9a-fA-F]{16});\s*proof=(?<proof>[0-9a-fA-F]{64})\s*-->'
+          manual_nonce=$(printf '%s' "$marker" | jq -r --arg re "$MANUAL_RE" '.body // "" | try capture($re).nonce catch empty')
+          manual_proof=$(printf '%s' "$marker" | jq -r --arg re "$MANUAL_RE" '.body // "" | try capture($re).proof catch empty')
+          # Manual-SHAPED but not well-formed — e.g. the unproven SAN-321 shape
+          # `actor=Robb; source=manual`. Tracked separately so it fails closed
+          # with a message that names the actual problem instead of a generic
+          # "malformed marker".
+          manual_shaped=$(printf '%s' "$marker" | jq -r 'if ((.body // "") | test("codex-p1-ack\\s*:[^>]*source=manual")) then "true" else "false" end')
+
+          identity_valid=false
+          actor="unverified acknowledgement"
+          # self-declared = an agent naming itself and its Multica run, which
+          # GitHub cannot corroborate. verified = an HMAC only the holder of
+          # CODEX_ACK_MANUAL_SECRET can produce. The status publishes which.
+          actor_kind="unverified"
+          if [ "$marker_count" -ne 1 ]; then
+            echo "FAIL CLOSED: expected exactly one codex-p1-ack marker from ${label_actor} before label at ${ack_time}; found ${marker_count}."
+          elif [ -n "$manual_nonce" ] && [ -n "$manual_proof" ]; then
+            # A NONCE IS SPENT BY ITS FIRST PUBLICATION. A proof is public the
+            # moment it is posted, so the marker being validated has to BE that
+            # first publication — anyone can copy the comment, nobody can copy
+            # their way to being earlier than it.
+            #
+            # Why this shape rather than "the nonce appears exactly once":
+            #   - Counting only the LABEL PRINCIPAL's markers breaks the moment
+            #     more than one principal can label, which is the direction this
+            #     repo is meant to move in (per-agent identities). Principal B
+            #     copies A's public marker, applies the label itself, sees one
+            #     use of the nonce among its own comments, and the HMAC — whose
+            #     message names no principal — still verifies and publishes a
+            #     sign-off by A. Codex P1 on martin#50.
+            #   - Counting ACROSS principals instead turns any copy into a
+            #     permanent denial of the break-glass path: post a copy of each
+            #     fresh marker as it appears and the count is never 1 again.
+            # Earliest-publication has neither failure. It also makes binding the
+            # principal into the signed message unnecessary: a replay is by
+            # definition not the first publication, so there is nothing for a
+            # second principal to gain, and Robb never has to know which account
+            # will apply the label.
+            #
+            # A tie on the earliest timestamp is rejected as unorderable, the
+            # same doctrine as every other ordering comparison here. It also
+            # cannot occur honestly: a nonce is unguessable until the comment
+            # that publishes it exists.
+            #
+            # (Deleting the first publication to make a copy the earliest is
+            # possible with this token, and is out of reach of any in-GitHub
+            # control; see the header.)
+            # Edited comments are excluded here too, and for the same reason: an
+            # edit that back-dates a copy into first place would otherwise
+            # disqualify the genuine marker it copied.
+            nonce_markers=$(printf '%s' "$comments" | jq -c --arg n "$manual_nonce" --arg re "$MANUAL_RE" '
+              [ .[]
+                | select(.created_at == .updated_at)
+                | select(((.body // "") | try capture($re).nonce catch "") == $n)
+                | .created_at
+              ] | sort')
+            nonce_first_at=$(printf '%s' "$nonce_markers" | jq -r 'first // ""')
+            nonce_first_count=$(printf '%s' "$nonce_markers" | jq --arg a "$nonce_first_at" '[.[] | select(. == $a)] | length')
+            if [ -z "${MANUAL_ACK_SECRET:-}" ]; then
+              echo "FAIL CLOSED: manual codex-p1-ack marker present but CODEX_ACK_MANUAL_SECRET is not configured on this repository."
+            elif [ "$marker_at" != "$nonce_first_at" ] || [ "$nonce_first_count" -ne 1 ]; then
+              echo "FAIL CLOSED: this nonce was first published at ${nonce_first_at} (x${nonce_first_count}), not by the marker at ${marker_at}; a nonce is spent by its first publication."
+            else
+              # The expected proof NEVER leaves this subshell. It is derived
+              # from a secret rather than being one, so GitHub would not mask
+              # it in the log, and printing it hands anyone a valid proof for
+              # this PR — the exact forgery this branch exists to stop. So the
+              # comparison happens inside python and only `ok`/`no` comes back.
+              # The key arrives over a pipe for the same reason as in
+              # scripts/codex-ack-marker.sh; nonce and proof are already
+              # regex-constrained to hex, so passing them in argv is safe.
+              # compare_digest is the constant-time comparison.
+              #
+              # One line, deliberately: this is a YAML block scalar, so a
+              # multi-line python program would have to be indented to stay
+              # inside the block, and indented top-level python is a syntax
+              # error. Every statement here is simple, so `;` is enough.
+              #
+              # WHAT THE MESSAGE BINDS, AND WHAT IT DELIBERATELY DOES NOT.
+              # Repo, PR and nonce — so a proof is useless on another PR, and
+              # useless twice on this one. Not the head SHA: that would void a
+              # valid acknowledgement on the next unrelated push and the path
+              # would be abandoned as unusable. Not the acknowledgement time:
+              # the scope comes from the marker comment's own timestamp, which
+              # the signer cannot predict and does not need to. Not the label
+              # principal: replay by a second principal is already impossible,
+              # because a copy cannot be the first publication of its nonce.
+              manual_msg="codex-p1-ack:v1:${GITHUB_REPOSITORY}#${PR_NUMBER}:${manual_nonce}"
+              proof_ok=$(
+                printf '%s' "$MANUAL_ACK_SECRET" \
+                  | python3 -c 'import hashlib,hmac,sys;k=sys.stdin.buffer.read();e=hmac.new(k,sys.argv[1].encode(),hashlib.sha256).hexdigest();print("ok" if hmac.compare_digest(e,sys.argv[2].lower()) else "no")' \
+                    "$manual_msg" "$manual_proof"
+              )
+              if [ "$proof_ok" = "ok" ]; then
+                identity_valid=true
+                actor="Robb"
+                actor_kind="verified"
+                echo "Manual acknowledgement by Robb VERIFIED before label at ${ack_time}."
+              else
+                echo "FAIL CLOSED: manual codex-p1-ack proof does not verify for ${GITHUB_REPOSITORY}#${PR_NUMBER}."
+              fi
+            fi
+          elif [ "$manual_shaped" = "true" ]; then
+            echo "FAIL CLOSED: manual codex-p1-ack marker carries no nonce+proof. A Robb acknowledgement must be proven — see scripts/codex-ack-marker.sh (SAN-338)."
+          elif [ -n "$marker_actor" ] && [ -n "$marker_run" ]; then
+            # RESERVED NAME. Without this the forgery just moves to the
+            # run-referenced branch: `actor=Robb; run=<any uuid>` would publish
+            # the same unearned human sign-off (SAN-338).
+            #
+            # Compared on LETTERS ONLY and ANYWHERE IN THE NAME, because the
+            # actor pattern also admits space, dot and hyphen. Two rounds of
+            # Codex P1 on martin#50 walked in from both ends of that:
+            #   - anchored on `robb` + whitespace or end-of-string, `actor=Robb.`
+            #     and `actor=Robb-` went through;
+            #   - anchored on a `robb` PREFIX, `actor=Mr Robb` and `actor=R. Robb`
+            #     went through as `mrrobb` and `rrobb`.
+            # Both publish the same human-looking sign-off with no HMAC behind
+            # it. Stripping to letters and testing for `robb` anywhere collapses
+            # every variant onto one check.
+            #
+            # A substring test rather than an allowlist of agent names: an
+            # allowlist has to be edited every time the fleet gains an agent,
+            # and the failure mode of a stale one is a valid acknowledgement
+            # rejected, which is how break-glass paths get abandoned. The cost
+            # of the substring is that an agent genuinely named something
+            # containing `robb` cannot use this branch, which is a name nobody
+            # has and a fail-closed direction anyway.
+            actor_norm=$(printf '%s' "$marker_actor" | tr -cd '[:alpha:]' | tr '[:upper:]' '[:lower:]')
+            case "$actor_norm" in *robb*) reserved=1 ;; *) reserved=0 ;; esac
+            if [ "$reserved" -eq 1 ]; then
+              echo "FAIL CLOSED: a run-referenced codex-p1-ack must name the acting agent. Robb cannot be claimed this way — use scripts/codex-ack-marker.sh (SAN-338)."
+            else
+              identity_valid=true
+              actor="$marker_actor"
+              actor_kind="self-declared"
+              echo "Agent acknowledgement: ${actor}, run ${marker_run}, before label at ${ack_time}."
+            fi
+          else
+            echo "FAIL CLOSED: malformed codex-p1-ack marker before label at ${ack_time}."
+          fi
 
           prior=$(
             gh api --paginate "repos/${{ github.repository }}/commits/${HEAD_SHA}/statuses" \
               | jq -s -r '[.[] | .[] | select(.context == "codex-review")] | sort_by(.created_at) | last | .state // "none"'
           )
 
-          if [ "$has_label" = "true" ]; then
+          # ack_time is the SCOPE of the dismissal, and it is the marker's
+          # timestamp rather than the label's. An unvalidatable marker scopes
+          # nothing at all: emitting a scope for a claim that failed validation
+          # would silence findings on the strength of the claim this step just
+          # rejected. The verdict step turns that empty scope into a failure
+          # whenever the ack was load-bearing.
+          if [ "$has_label" = "true" ] && [ "$identity_valid" = "true" ]; then
             echo "active=true" >> "$GITHUB_OUTPUT"
-            echo "ack_time=${ack_time}" >> "$GITHUB_OUTPUT"
-            echo "Override active: codex-p1-ack applied by ${actor} at ${ack_time}; findings after that time still block."
+            echo "ack_time=${marker_at}" >> "$GITHUB_OUTPUT"
+            echo "Override active: codex-p1-ack signed by ${actor} at ${marker_at} (label at ${ack_time}); findings from that moment on still block."
+          elif [ "$has_label" = "true" ]; then
+            echo "active=true" >> "$GITHUB_OUTPUT"
+            echo "ack_time=" >> "$GITHUB_OUTPUT"
+            echo "Override present but its identity could not be established; scoping nothing."
           else
             echo "active=false" >> "$GITHUB_OUTPUT"
             echo "ack_time=" >> "$GITHUB_OUTPUT"
           fi
-          echo "actor=${actor}" >> "$GITHUB_OUTPUT"
+          # CLAMPED because the declared actor is the only unbounded part of a
+          # status description, and GitHub truncates those at 140 characters.
+          # The marker pattern admits 71 characters of name, which is enough to
+          # push the longest verdict wording over the limit — and the first
+          # thing cut is the trailing `(self-declared)`, i.e. exactly the part
+          # that stops the status reading as a verified sign-off. Real agent
+          # names are nowhere near 48.
+          echo "actor=${actor:0:48}" >> "$GITHUB_OUTPUT"
+          echo "actor_kind=${actor_kind}" >> "$GITHUB_OUTPUT"
+          echo "identity_valid=${identity_valid}" >> "$GITHUB_OUTPUT"
           echo "prior=${prior}" >> "$GITHUB_OUTPUT"
           # Withdrawn = the label has been removed at least once and is not
           # on now. Used to fail closed if severity cannot be re-derived.
@@ -670,6 +1019,7 @@ jobs:
 
           echo "graded=${graded}" >> "$GITHUB_OUTPUT"
           echo "blocking_total=${blocking_total}" >> "$GITHUB_OUTPUT"
+          echo "unclassified_total=${unclassified_total}" >> "$GITHUB_OUTPUT"
           echo "blocking=${blocking_live}" >> "$GITHUB_OUTPUT"
           echo "unclassified=${unclassified_live}" >> "$GITHUB_OUTPUT"
           echo "Severity on ${HEAD_SHA}: graded=${graded} blocking=${blocking_live}/${blocking_total} unclassified=${unclassified_live}/${unclassified_total} ack=${ACK_TIME:-none}"
@@ -689,8 +1039,11 @@ jobs:
           BLOCKING: ${{ steps.severity.outputs.blocking }}
           BLOCKING_TOTAL: ${{ steps.severity.outputs.blocking_total }}
           UNCLASSIFIED: ${{ steps.severity.outputs.unclassified }}
+          UNCLASSIFIED_TOTAL: ${{ steps.severity.outputs.unclassified_total }}
           OVERRIDE: ${{ steps.override.outputs.active }}
           OVERRIDE_ACTOR: ${{ steps.override.outputs.actor }}
+          OVERRIDE_ACTOR_KIND: ${{ steps.override.outputs.actor_kind }}
+          OVERRIDE_IDENTITY_VALID: ${{ steps.override.outputs.identity_valid }}
           WITHDRAWN: ${{ steps.override.outputs.withdrawn }}
           PRIOR: ${{ steps.override.outputs.prior }}
         run: |
@@ -719,7 +1072,39 @@ jobs:
 
           echo "post=true" >> "$GITHUB_OUTPUT"
 
-          if [ "${BLOCKING:-0}" -gt 0 ]; then
+          # ORDER MATTERS, AND THE ACK CLAUSES ARE SCOPED TO A LOAD-BEARING
+          # ACKNOWLEDGEMENT (SAN-338). An ack is load-bearing when there is a
+          # finding for it to dismiss. Two things follow, and both were wrong
+          # before:
+          #   - An unvalidatable marker blocks only when the ack is doing work.
+          #     A leftover label on a clean PR used to wedge it outright.
+          #   - No actor is named on a status the ack did not change. The old
+          #     `codex-p1-ack recorded by <actor> — no P0/P1` line published a
+          #     human sign-off that was neither needed nor proven, and it is the
+          #     exact string the martin#46 forgery produced.
+          #
+          # LOAD-BEARING COUNTS BOTH KINDS OF FINDING, and `BLOCKING_TOTAL`
+          # alone is not that test. An unreadable finding matches no severity
+          # pattern, so it never reaches BLOCKING_TOTAL, while an ack applied
+          # after it does silence it out of UNCLASSIFIED. Scoping identity to
+          # BLOCKING_TOTAL therefore let a missing or malformed marker suppress
+          # a format-drift finding unchallenged — the one guard whose whole job
+          # is to fail closed when Codex's format moves. Codex P1 on martin#50.
+          ack_load_bearing=0
+          if [ "${BLOCKING_TOTAL:-0}" -gt 0 ] || [ "${UNCLASSIFIED_TOTAL:-0}" -gt 0 ]; then
+            ack_load_bearing=1
+          fi
+
+          # IDENTITY IS CHECKED FIRST, and only because an unvalidatable marker
+          # now scopes nothing: every pre-existing finding stays live, so the
+          # BLOCKING clause below would catch this case anyway and report it as a
+          # plain P0/P1. Both block. Leading with the identity message is the one
+          # that tells the reader what to actually do about it.
+          if [ "${OVERRIDE:-false}" = "true" ] && [ "$ack_load_bearing" -eq 1 ] && [ "${OVERRIDE_IDENTITY_VALID:-false}" != "true" ]; then
+            echo "state=failure" >> "$GITHUB_OUTPUT"
+            echo "description=codex-p1-ack identity not established — re-acknowledge with a valid PR marker" >> "$GITHUB_OUTPUT"
+            echo "FAILURE: acknowledgement identity cannot be established; failing closed."
+          elif [ "${BLOCKING:-0}" -gt 0 ]; then
             echo "state=failure" >> "$GITHUB_OUTPUT"
             echo "description=Codex filed ${BLOCKING} P0/P1 on this commit — fix, or label codex-p1-ack" >> "$GITHUB_OUTPUT"
             echo "FAILURE: ${BLOCKING} live blocking finding(s)."
@@ -729,8 +1114,15 @@ jobs:
             echo "FAILURE: ${UNCLASSIFIED} unclassified finding(s); failing closed on format drift."
           elif [ "${OVERRIDE:-false}" = "true" ] && [ "${BLOCKING_TOTAL:-0}" -gt 0 ]; then
             echo "state=success" >> "$GITHUB_OUTPUT"
-            echo "description=${BLOCKING_TOTAL} P0/P1 dismissed via codex-p1-ack by ${OVERRIDE_ACTOR}" >> "$GITHUB_OUTPUT"
-            echo "SUCCESS: ${BLOCKING_TOTAL} finding(s) dismissed by ${OVERRIDE_ACTOR}; none raised since."
+            echo "description=${BLOCKING_TOTAL} P0/P1 dismissed via codex-p1-ack by ${OVERRIDE_ACTOR} (${OVERRIDE_ACTOR_KIND})" >> "$GITHUB_OUTPUT"
+            echo "SUCCESS: ${BLOCKING_TOTAL} P0/P1 and ${UNCLASSIFIED_TOTAL:-0} unreadable finding(s) dismissed by ${OVERRIDE_ACTOR} (${OVERRIDE_ACTOR_KIND}); none raised since."
+          elif [ "${OVERRIDE:-false}" = "true" ] && [ "${UNCLASSIFIED_TOTAL:-0}" -gt 0 ]; then
+            # Reached only when the ack covers unreadable findings and no P0/P1.
+            # Kept separate rather than folded into the line above so neither
+            # description risks GitHub's 140-character truncation.
+            echo "state=success" >> "$GITHUB_OUTPUT"
+            echo "description=${UNCLASSIFIED_TOTAL} unreadable finding(s) dismissed via codex-p1-ack by ${OVERRIDE_ACTOR} (${OVERRIDE_ACTOR_KIND})" >> "$GITHUB_OUTPUT"
+            echo "SUCCESS: ${UNCLASSIFIED_TOTAL} unreadable finding(s) dismissed by ${OVERRIDE_ACTOR} (${OVERRIDE_ACTOR_KIND}); none raised since."
           else
             echo "state=success" >> "$GITHUB_OUTPUT"
             echo "description=Codex reviewed this commit — no P0/P1" >> "$GITHUB_OUTPUT"
