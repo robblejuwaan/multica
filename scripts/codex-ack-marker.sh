@@ -6,8 +6,17 @@
 # agent one. SAN-321 shipped a manual branch that took `actor=Robb;
 # source=manual` on trust, and an agent used it to publish "codex-p1-ack
 # recorded by Robb" on martin#46 with no involvement from Robb. The gate now
-# requires an HMAC over the PR, keyed by a secret only Robb holds, before it will
-# name him. This script produces that marker.
+# requires an HMAC over the PR, keyed by CODEX_ACK_MANUAL_SECRET, before it will
+# accept a manual acknowledgement at all. This script produces that marker.
+#
+# WHAT IT BUYS, STATED HONESTLY. GitHub hands repository secrets to workflow
+# runs on ANY branch, and the agents' token can push a branch, so this secret is
+# reachable by anything with write access here. A passing manual acknowledgement
+# therefore shows the secret was held, not that Robb was present, and the status
+# says so — `with the repo ack secret (not proof of Robb)`. What it removes is
+# the cheap path: an agent following its instructions has no proof in hand, and
+# taking one leaves a branch and a run behind. Per-agent GitHub identities are
+# the real fix and are still deferred.
 #
 # USAGE
 #   scripts/codex-ack-marker.sh <pr-number> [owner/repo]
@@ -69,6 +78,16 @@ case "$repo" in
     exit 64
     ;;
 esac
+# CASE-NORMALISED, because the workflow signs a name from a different source.
+# It uses GITHUB_REPOSITORY, which is GitHub's canonical casing; this script
+# uses `remote.origin.url` (or argv), which is whatever was typed. On a repo
+# with a capital in its name, a differently-cased local remote mints a proof
+# that will not verify. It fails safe, but it reads as "the manual path is
+# broken" to whoever hits it. Owner and repo names are case-insensitively
+# unique on GitHub, so lowercasing both sides is a total normalisation with no
+# network call. `A-Z` rather than `[:upper:]`: repo names are ASCII, and the
+# class form is locale-dependent. Codex P2, SAN-350.
+repo=$(printf '%s' "$repo" | tr 'A-Z' 'a-z')
 
 printf 'CODEX_ACK_MANUAL_SECRET (not echoed): ' >&2
 read -rs secret
