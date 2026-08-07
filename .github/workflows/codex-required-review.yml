@@ -632,11 +632,22 @@ jobs:
             # edited, so requiring equality rejects the whole class. Cost: a
             # typo fix on a marker comment invalidates it and needs a fresh
             # marker, which fails in the safe direction.
+            # STRICTLY BEFORE THE LABEL. GitHub truncates timestamps to whole
+            # seconds, so a marker and a label in the SAME second are unorderable,
+            # and an inclusive comparison resolved that TOWARD the merge: apply a
+            # bare load-bearing label, post a valid marker inside the same second,
+            # and the acknowledgement goes green on evidence that did not exist
+            # when it was made. Same doctrine as the strict `>` on the withdrawal
+            # cutoff below and the `>=` on the ack scope — unverifiable ordering
+            # resolves against the merge, never toward it. Codex P1 on
+            # eva-chen#34, where `labeled` is a workflow trigger and the race is
+            # therefore cheapest. Cost: an acknowledger who labels within a second
+            # of posting the marker must post a fresh one, which fails safe.
             marker_candidates=$(printf '%s' "$comments" | jq -c --arg start "$marker_window_start" --arg end "$ack_time" --arg label_actor "$label_actor" --arg unack "$last_unack_at" '
               [ .[]
                 | select(.user.login == $label_actor)
                 | select(.created_at == .updated_at)
-                | select(.created_at >= $start and .created_at <= $end)
+                | select(.created_at >= $start and .created_at < $end)
                 | select($unack == "" or .created_at > $unack)
                 | select(.body | test("<!--\\s*codex-p1-ack\\s*:"))
               ] | sort_by(.created_at)')
@@ -647,7 +658,16 @@ jobs:
             marker_candidates='[]'
           fi
           marker=$(printf '%s' "$marker_candidates" | jq -c 'last // empty')
-          marker_count=$(printf '%s' "$marker_candidates" | jq 'length')
+          # OCCURRENCES, NOT COMMENTS. `length` counted candidate COMMENTS, so one
+          # comment carrying two markers passed as a count of 1 and the unanchored
+          # `capture` below then silently picked whichever matched first. Two
+          # markers naming different actors would publish an arbitrary one of
+          # them: ambiguous evidence resolving into a confident attribution, which
+          # is the whole class this gate exists to stop. Counting openings rather
+          # than whole markers is deliberate — a malformed second marker has to
+          # fail the comment too, and it would not match a well-formed pattern.
+          # Codex P1 on santos-brand#5 and multica#4, P2 on eva-chen#34.
+          marker_count=$(printf '%s' "$marker_candidates" | jq '[ .[] | (.body // "") | [ match("<!--\\s*codex-p1-ack\\s*:"; "g") ] | length ] | add // 0')
           # When the marker was signed. This, not the label event, is what the
           # dismissal is scoped to — see the header.
           marker_at=$(printf '%s' "$marker" | jq -r '.created_at // ""')
