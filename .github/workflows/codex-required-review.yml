@@ -573,6 +573,14 @@ jobs:
                 | select(.created_at <= $end)
                 | .created_at ] | sort | last // ""')
             comments=$(gh api --paginate "repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" | jq -s '[.[] | .[]]')
+            # STRICTLY BEFORE THE LABEL. GitHub timestamps are second-
+            # resolution, so a marker posted in the SAME second as the label is
+            # unorderable — and since posting a comment is itself a trigger,
+            # `<=` would let label-first-then-marker validate in the run that
+            # very comment starts. Retroactive acknowledgement. Same doctrine
+            # as the `>` on the withdrawal cutoff: unorderable resolves against
+            # the merge. Codex P1 on eva-chen#35, santos-brand#6, multica#5.
+            #
             # AN EDITED COMMENT IS NOT A MARKER. Editing preserves created_at
             # and only moves updated_at, so without this you can post an empty
             # comment now and edit a marker into it later while keeping the
@@ -584,7 +592,7 @@ jobs:
               [ .[]
                 | select(.user.login == $label_actor)
                 | select(.created_at == .updated_at)
-                | select(.created_at >= $start and .created_at <= $end)
+                | select(.created_at >= $start and .created_at < $end)
                 | select($unack == "" or .created_at > $unack)
                 | select(.body | test("<!--\\s*codex-p1-ack\\s*:"))
               ] | sort_by(.created_at)')
