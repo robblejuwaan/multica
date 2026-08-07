@@ -181,6 +181,51 @@ name: Codex Required Review
 # (SAN-321 named it; still deferred), and until then the honest reading of a
 # secret-signed ack is "someone who can run a workflow in this repo".
 #
+# KEEP EVERY `run:` BLOCK UNDER 20 KB. GitHub Actions refuses to load a
+# workflow whose single `run:` script is too large, and it refuses the WHOLE
+# FILE: the workflow's name reverts to its path and no run of any kind fires,
+# so the required check never posts and every PR on the repo wedges. Nothing
+# says so on the PR — the only signal is a jobless `failure` run named
+# `.github/workflows/codex-required-review.yml` on a push event. Measured on
+# martin 2026-08-06: 20,320 bytes loaded, 20,965 bytes did not. actionlint and
+# a YAML parse both accept the oversized file; neither checks this. The
+# `override` step is the big one and it is ~60% commentary, so PUT NEW PROSE IN
+# THIS HEADER rather than in the step. SAN-350 took martin's gate down for
+# thirteen minutes by adding comments to it, which is why this is here.
+#
+# THE MARKER WINDOW, AND WHY EVERY BOUND ON IT IS STRICT. GitHub records every
+# Santos agent as the shared token owner, so no label-only acknowledgement is
+# attributable. Every actor therefore declares itself in a durable,
+# machine-readable PR comment before applying the label, and the `override` step
+# accepts that comment only inside a ten-minute window ending strictly before
+# the label and starting strictly after the most recent withdrawal.
+#
+# STRICTLY BEFORE THE LABEL. Timestamps are second-resolution, so a marker and a
+# label in the SAME second are unorderable, and an inclusive `<=` resolved that
+# TOWARD the merge: apply a bare load-bearing label, post a valid marker inside
+# the same second, and the acknowledgement goes green on evidence that did not
+# exist when it was made. Re-running the gate to collect that is free on every
+# repo carrying this file — `labeled` is a trigger on some of them, and on the
+# rest posting the marker comment is itself the trigger. Codex P1, SAN-348 on
+# martin and eva-chen#34 here. Cost: an acknowledger who labels within a second
+# of posting the marker must post a fresh one, which fails safe.
+#
+# A MARKER DIES WITH THE LABEL IT AUTHORISED (SAN-338), so the window also
+# starts strictly after the most recent withdrawal. Counting nonce re-use across
+# comments does not notice a marker being spent TWICE on the SAME comment.
+# Without the cutoff: remove the label, wait inside the ten minutes for Codex to
+# file a fresh P0/P1, put the label back. The original comment still yields
+# nonce_uses == 1 and the public proof still verifies, while the new and later
+# ack_time scopes away a finding the acknowledger never saw. Codex P1 on
+# martin#50. Re-acknowledging after a withdrawal means a fresh marker, which is
+# what running scripts/codex-ack-marker.sh again produces.
+#
+# A malformed marker inside the window is a claimed but unverifiable agent
+# action, so it keeps the gate closed rather than being ignored.
+#
+# One doctrine under all three: UNVERIFIABLE ORDERING RESOLVES AGAINST THE
+# MERGE, never toward it.
+#
 # ATTRIBUTION IS ONLY PUBLISHED WHERE IT MEANS SOMETHING (SAN-338). A status
 # names an acknowledging actor only when the acknowledgement actually dismissed
 # a finding. With no P0/P1 on the commit the ack did nothing, so the status
@@ -600,46 +645,14 @@ jobs:
           ack_time=$(printf '%s' "$ack_event" | jq -r '.created_at // ""')
           label_actor=$(printf '%s' "$ack_event" | jq -r '.actor.login // "unknown"')
 
-          # GitHub records every Santos agent as the shared token owner, so no
-          # label-only acknowledgement is attributable. Every actor therefore
-          # declares itself in a durable, machine-readable PR comment before
-          # applying the label. We deliberately do not look at or after the
-          # label's own second: a later comment rewriting an acknowledgement's
-          # history is the whole thing the before-the-label rule prevents, and
-          # GitHub timestamps are second-resolution, so a marker sharing the
-          # label's second is unorderable against it. An inclusive `<=` resolved
-          # that TOWARD the merge — apply a bare load-bearing label, post a valid
-          # marker inside the same second, and the acknowledgement goes green on
-          # evidence that did not exist when it was made. Re-running the gate to
-          # collect that is free on every repo carrying this file: `labeled` is a
-          # trigger on some of them, and on the rest posting the marker comment
-          # is itself the trigger. That is a retroactive acknowledgement — the
-          # class SAN-338 closed on the withdrawal path — so the bound is strict,
-          # the same doctrine as the `>` on the withdrawal cutoff below and the
-          # `>=` on the ack scope: unverifiable ordering resolves against the
-          # merge, never toward it. Codex P1, SAN-348 here and eva-chen#34 there.
-          # Cost: an acknowledger who labels within a second of posting the
-          # marker must post a fresh one, which fails safe.
+          # THE MARKER WINDOW: ten minutes, ending strictly BEFORE the label,
+          # starting strictly AFTER the most recent withdrawal. Every bound is
+          # strict on purpose, and a malformed marker inside it keeps the gate
+          # closed rather than being ignored. Rationale and the three Codex P1s
+          # behind it are in the header, under THE MARKER WINDOW.
           #
-          # A malformed marker in the ten-minute acknowledgement window is a
-          # claimed but unverifiable agent action, so keep the gate closed.
-          # A MARKER DIES WITH THE LABEL IT AUTHORISED (SAN-338). The window also
-          # starts after the most recent withdrawal, because counting nonce
-          # re-use across comments does not notice a marker being spent TWICE on
-          # the SAME comment. Without this: remove the label, wait inside the ten
-          # minutes for Codex to file a fresh P0/P1, put the label back. The
-          # original comment still yields nonce_uses == 1 and the public proof
-          # still verifies, while the new and later ack_time scopes away a
-          # finding the acknowledger never saw. Codex P1 on martin#50.
-          #
-          # Strictly after, so an unlabel and a marker in the same UTC second are
-          # unorderable and therefore rejected — the same doctrine as the strict
-          # `<` on the push/mention comparison and the `>=` on the ack scope:
-          # unverifiable ordering resolves against the merge. Re-acknowledging
-          # after a withdrawal means a fresh marker, which is what running
-          # scripts/codex-ack-marker.sh again produces.
-          # One definition, used by the candidate prefilter and by the
-          # occurrence count below. See the note at marker_candidates.
+          # One definition of "a marker starts here", shared by the candidate
+          # prefilter and the occurrence count below so the two cannot drift.
           MARKER_OPEN='<!--\s*codex-p1-ack\s*:'
           comments='[]'
           if [ -n "$ack_time" ]; then
@@ -667,21 +680,12 @@ jobs:
             # edited, so requiring equality rejects the whole class. Cost: a
             # typo fix on a marker comment invalidates it and needs a fresh
             # marker, which fails in the safe direction.
-            # $MARKER_OPEN is the one definition of "a marker starts here". It
-            # is used twice — to select candidate comments, and to COUNT markers
-            # in the selected one — and the two must agree, or a comment can be
-            # admitted by one pattern and counted by another. Passed as an
-            # argument rather than written out twice for that reason.
             #
-            # This predicate is a PREFILTER, not the exactness check. It admits a
-            # comment that contains AT LEAST one marker opening; requiring
-            # exactly one HERE would be wrong, because a comment carrying two
-            # markers would then simply drop out of the candidate set and the
-            # ambiguity would go unnoticed instead of failing closed. Exactness
-            # is enforced by marker_count below, on the candidates. Codex read
-            # this line as the exactness check (P1 on santos-brand#5 and
-            # multica#4, P2 on eva-chen#34) — which it was, before that count
-            # started counting occurrences rather than comments.
+            # A PREFILTER, not the exactness check: it admits a comment carrying
+            # AT LEAST one marker opening. Requiring exactly one HERE would drop
+            # a two-marker comment out of the candidate set and let the ambiguity
+            # go unnoticed instead of failing closed. Exactness is marker_count's
+            # job, below.
             marker_candidates=$(printf '%s' "$comments" | jq -c --arg start "$marker_window_start" --arg end "$ack_time" --arg label_actor "$label_actor" --arg unack "$last_unack_at" --arg open "$MARKER_OPEN" '
               [ .[]
                 | select(.user.login == $label_actor)
@@ -697,15 +701,14 @@ jobs:
             marker_candidates='[]'
           fi
           marker=$(printf '%s' "$marker_candidates" | jq -c 'last // empty')
-          # OCCURRENCES, NOT COMMENTS. `length` counted candidate COMMENTS, so one
-          # comment carrying two markers passed as a count of 1 and the unanchored
-          # `capture` below then silently picked whichever matched first. Two
-          # markers naming different actors would publish an arbitrary one of
-          # them: ambiguous evidence resolving into a confident attribution, which
-          # is the whole class this gate exists to stop. Counting openings rather
-          # than whole markers is deliberate — a malformed second marker has to
-          # fail the comment too, and it would not match a well-formed pattern.
-          # Codex P1 on santos-brand#5 and multica#4, P2 on eva-chen#34.
+          # OCCURRENCES, NOT COMMENTS. `length` counted candidate COMMENTS, so a
+          # comment carrying two markers passed as 1, and the unanchored
+          # `capture` below then took whichever matched first: two markers naming
+          # different actors published an arbitrary one of them — ambiguous
+          # evidence resolving into a confident attribution, which is the class
+          # this gate exists to stop. Openings rather than whole markers,
+          # deliberately: a malformed second marker has to fail the comment too,
+          # and it would not match a well-formed pattern. Codex P1, SAN-350.
           marker_count=$(printf '%s' "$marker_candidates" | jq --arg open "$MARKER_OPEN" '[ .[] | (.body // "") | [ match($open; "g") ] | length ] | add // 0')
           # When the marker was signed. This, not the label event, is what the
           # dismissal is scoped to — see the header.
@@ -818,20 +821,14 @@ jobs:
               # principal: replay by a second principal is already impossible,
               # because a copy cannot be the first publication of its nonce.
               #
-              # CASE-NORMALISED, because the two sides read the repo name from
-              # different places. Here it is GITHUB_REPOSITORY, which carries
-              # GitHub's canonical casing; in scripts/codex-ack-marker.sh it is
-              # `remote.origin.url`, which carries whatever was typed when the
-              # clone was made. On a repo with a capital in its name a
-              # differently-cased local remote mints a proof that cannot verify
-              # — safe, since a bad proof is only ever rejected, but it reads as
-              # "the manual path is broken" to whoever hits it. Owner and repo
-              # names are case-insensitively unique on GitHub, so lowercasing is
-              # a total normalisation and needs no network call. `A-Z` rather
-              # than `[:upper:]`: repo names are ASCII, and the class form is
-              # locale-dependent. Codex P2, SAN-350. A marker minted by a copy
-              # of the script older than this no longer verifies here; that
-              # fails closed and a fresh marker fixes it.
+              # CASE-NORMALISED. This side reads GITHUB_REPOSITORY, GitHub's
+              # canonical casing; scripts/codex-ack-marker.sh reads the local
+              # remote, whatever was typed. A capital in a repo name would mint a
+              # proof that cannot verify — safe, but it reads as "the manual path
+              # is broken". Owner and repo names are case-insensitively unique on
+              # GitHub, so lowercasing is total and needs no network call. `A-Z`
+              # not `[:upper:]`: repo names are ASCII, the class form is
+              # locale-dependent. Codex P2, SAN-350.
               repo_key=$(printf '%s' "$GITHUB_REPOSITORY" | tr 'A-Z' 'a-z')
               manual_msg="codex-p1-ack:v1:${repo_key}#${PR_NUMBER}:${manual_nonce}"
               proof_ok=$(
