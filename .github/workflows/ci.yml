@@ -18,7 +18,7 @@ jobs:
   # nothing from a full web build. This job emits a single `frontend`
   # output consumed by the frontend job below.
   changes:
-    runs-on: [self-hosted, linux, x64]
+    runs-on: ubuntu-latest
     permissions:
       contents: read
       pull-requests: read
@@ -89,7 +89,7 @@ jobs:
   # runner to itself and everything else shares the other one.
   frontend-build:
     needs: changes
-    runs-on: [self-hosted, linux, x64]
+    runs-on: ubuntu-latest
     env:
       # Pin turbo's filesystem cache somewhere actions/cache can address.
       TURBO_CACHE_DIR: .turbo/cache
@@ -163,7 +163,7 @@ jobs:
 
   frontend-test:
     needs: changes
-    runs-on: [self-hosted, linux, x64]
+    runs-on: ubuntu-latest
     env:
       TURBO_CACHE_DIR: .turbo/cache
     steps:
@@ -224,7 +224,7 @@ jobs:
     # is cancelled by the concurrency group above, and there is no reason to
     # spend a runner reporting a verdict nobody will read.
     if: ${{ !cancelled() }}
-    runs-on: [self-hosted, linux, x64]
+    runs-on: ubuntu-latest
     steps:
       - name: Check frontend job results
         env:
@@ -239,7 +239,7 @@ jobs:
           fi
 
   backend:
-    runs-on: [self-hosted, linux, x64]
+    runs-on: ubuntu-latest
     services:
       postgres:
         image: pgvector/pgvector:pg17
