@@ -104,6 +104,34 @@ name: Codex Required Review
 # triggers (see above). The status then reads `success` naming who
 # dismissed it, so the act is visible rather than silent.
 #
+# WHO DISMISSED IT (SAN-343, porting SAN-321 + SAN-338 from `martin`). The
+# label alone is NOT the acknowledgement. Every Santos agent authenticates
+# as the shared token owner, so a label-only dismissal published
+# `by robblejuwaan` for an act no human performed — the exact thing the
+# break-glass log exists to prevent. The acting party now declares itself
+# in a durable PR comment BEFORE applying the label:
+#
+#   <!-- codex-p1-ack: actor=<Your Name>; run=<multica run uuid> -->
+#
+# Then apply the label, then comment again to re-check (label events are
+# deliberately not triggers here, see above). Comments posted after the
+# label are ignored for identity, so the re-check comment is free-form.
+#
+# The marker must be authored by the same principal that applies the label,
+# posted no more than ten minutes before it, after any earlier withdrawal,
+# and never edited afterwards (an edited comment is not a marker). Exactly
+# one marker may sit in that window. Anything else fails closed with
+# `codex-p1-ack identity not established`, and an unvalidatable marker
+# scopes NOTHING — every finding stays live.
+#
+# It is a SELF-DECLARATION and the status says so, reading
+# `dismissed via codex-p1-ack by <name> (self-declared)`. GitHub cannot
+# tell one agent on the shared token from another; what the marker buys is
+# a durable, attributable record rather than a human's name on an act they
+# did not perform. `actor=Robb` (in any spelling) is rejected outright, and
+# so is martin's `source=manual` shape — this repo has no human branch and
+# no status here will ever claim a human sign-off it cannot establish.
+#
 # The ack is TIME-SCOPED, not a permanent downgrade. It dismisses only
 # findings from reviews submitted BEFORE the label went on. A later Codex
 # review that raises a NEW P1 blocks again with no further human act.
@@ -488,24 +516,158 @@ jobs:
           # scopes which findings it covers, the second is what makes a
           # withdrawal restore the block instead of silently leaving green.
           timeline=$(gh api --paginate "repos/${{ github.repository }}/issues/${PR_NUMBER}/timeline" | jq -s '[.[] | .[]]')
-          ack_time=$(printf '%s' "$timeline" | jq -r '[.[] | select(.event == "labeled") | select(.label.name == "codex-p1-ack") | .created_at] | sort | last // ""')
+          label_time=$(printf '%s' "$timeline" | jq -r '[.[] | select(.event == "labeled") | select(.label.name == "codex-p1-ack") | .created_at] | sort | last // ""')
           unack_seen=$(printf '%s' "$timeline" | jq -r '[.[] | select(.event == "unlabeled") | select(.label.name == "codex-p1-ack")] | length')
-          actor=$(printf '%s' "$timeline" | jq -r '[.[] | select(.event == "labeled") | select(.label.name == "codex-p1-ack") | .actor.login] | last // "unknown"')
+          label_actor=$(printf '%s' "$timeline" | jq -r '[.[] | select(.event == "labeled") | select(.label.name == "codex-p1-ack") | .actor.login] | last // "unknown"')
+
+          # ---------------------------------------------------------------
+          # IDENTITY (SAN-343, porting SAN-321 + SAN-338 from `martin`).
+          #
+          # GitHub records every Santos agent as the shared token owner, so a
+          # label-only acknowledgement is attributable to nobody: this gate
+          # used to publish `dismissed via codex-p1-ack by robblejuwaan` for an
+          # act no human performed. The break-glass log exists to answer "who
+          # dismissed this P0/P1" and it was answering confidently and wrongly.
+          #
+          # So the actor declares itself in a durable, machine-readable PR
+          # comment BEFORE applying the label:
+          #
+          #   <!-- codex-p1-ack: actor=<Agent Name>; run=<multica run uuid> -->
+          #
+          # The marker must be authored by the same principal that applies the
+          # label, posted no more than ten minutes before it, and after the
+          # most recent withdrawal. We deliberately do not look after the
+          # label: that would let a later comment rewrite an acknowledgement's
+          # history.
+          #
+          # THIS IS A SELF-DECLARATION AND THE STATUS SAYS SO. GitHub cannot
+          # tell one agent on the shared token from another, so the marker
+          # records who CLAIMS to have acted, not who provably did. What it
+          # buys is a durable, attributable record on the PR and in the run
+          # log, and no human name on an act no human performed.
+          #
+          # THERE IS NO MANUAL/HUMAN BRANCH HERE. `martin` carries one behind
+          # an HMAC (CODEX_ACK_MANUAL_SECRET). SAN-338's independent review
+          # established that its `(verified)` wording overstates what it
+          # proves: anything that can push a workflow to a repo can read that
+          # repo's secrets, so possession of the secret is not a signature.
+          # These three repos never had a human branch, so none is added — a
+          # human dismissing a finding here uses a named marker like anyone
+          # else, and no status ever carries an unearned human name. A marker
+          # SHAPED like martin's manual one fails closed with that explained.
+          # ---------------------------------------------------------------
+          comments='[]'
+          marker_candidates='[]'
+          if [ -n "$label_time" ]; then
+            marker_window_start=$(date -u -d "${label_time} - 10 minutes" +%Y-%m-%dT%H:%M:%SZ)
+            # A MARKER DIES WITH THE LABEL IT AUTHORISED. Without this cutoff:
+            # remove the label, wait inside the ten minutes for Codex to file a
+            # fresh P0/P1, put the label back — and the original marker would
+            # re-authorise a dismissal of a finding its author never saw.
+            # Strictly after, so an unlabel and a marker in the same UTC second
+            # are unorderable and therefore rejected.
+            last_unack_at=$(printf '%s' "$timeline" | jq -r --arg end "$label_time" '
+              [ .[]
+                | select(.event == "unlabeled")
+                | select(.label.name == "codex-p1-ack")
+                | select(.created_at <= $end)
+                | .created_at ] | sort | last // ""')
+            comments=$(gh api --paginate "repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" | jq -s '[.[] | .[]]')
+            # AN EDITED COMMENT IS NOT A MARKER. Editing preserves created_at
+            # and only moves updated_at, so without this you can post an empty
+            # comment now and edit a marker into it later while keeping the
+            # earlier timestamp. GitHub sets updated_at == created_at on a
+            # comment nobody has edited, so requiring equality rejects the
+            # whole class. Cost: a typo fix invalidates the marker and needs a
+            # fresh one, which fails in the safe direction.
+            marker_candidates=$(printf '%s' "$comments" | jq -c --arg start "$marker_window_start" --arg end "$label_time" --arg label_actor "$label_actor" --arg unack "$last_unack_at" '
+              [ .[]
+                | select(.user.login == $label_actor)
+                | select(.created_at == .updated_at)
+                | select(.created_at >= $start and .created_at <= $end)
+                | select($unack == "" or .created_at > $unack)
+                | select(.body | test("<!--\\s*codex-p1-ack\\s*:"))
+              ] | sort_by(.created_at)')
+            if [ -n "$last_unack_at" ]; then
+              echo "codex-p1-ack was withdrawn at ${last_unack_at}; only markers posted after that count for the label at ${label_time}."
+            fi
+          fi
+          marker=$(printf '%s' "$marker_candidates" | jq -c 'last // empty')
+          marker_count=$(printf '%s' "$marker_candidates" | jq 'length')
+          # When the marker was posted. THIS, not the label event, is what the
+          # dismissal is scoped to: it is the moment the declaring actor could
+          # see the findings it claims to dismiss.
+          marker_at=$(printf '%s' "$marker" | jq -r '.created_at // ""')
+          MARKER_RE="<!--\\s*codex-p1-ack\\s*:\\s*actor=(?<actor>[A-Za-z][A-Za-z .-]{0,70});\\s*run=(?<run>[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\\s*-->"
+          marker_actor=$(printf '%s' "$marker" | jq -r --arg re "$MARKER_RE" '.body // "" | try capture($re).actor catch empty')
+          marker_run=$(printf '%s' "$marker" | jq -r --arg re "$MARKER_RE" '.body // "" | try capture($re).run catch empty')
+          # Martin's manual shape, which this repo does not honour. Detected
+          # separately so it fails closed with the real reason rather than a
+          # generic "malformed marker".
+          manual_shaped=$(printf '%s' "$marker" | jq -r 'if ((.body // "") | test("codex-p1-ack\\s*:[^>]*source=manual")) then "true" else "false" end')
+
+          identity_valid=false
+          actor="unknown"
+          actor_kind="unverified"
+
+          if [ "$has_label" != "true" ]; then
+            :
+          elif [ "$marker_count" -ne 1 ]; then
+            echo "FAIL CLOSED: expected exactly one codex-p1-ack marker from ${label_actor} in the ten minutes before the label at ${label_time}; found ${marker_count}."
+          elif [ "$manual_shaped" = "true" ]; then
+            echo "FAIL CLOSED: this repository has no manual codex-p1-ack branch. Acknowledge under your own name: <!-- codex-p1-ack: actor=<Your Name>; run=<multica run uuid> --> (SAN-343)."
+          elif [ -n "$marker_actor" ] && [ -n "$marker_run" ]; then
+            # RESERVED NAME. Without this the misattribution simply moves into
+            # the marker: `actor=Robb; run=<any uuid>` would publish the same
+            # unearned human sign-off the port exists to remove. Compared on
+            # LETTERS ONLY and ANYWHERE IN THE NAME, because the actor pattern
+            # admits space, dot and hyphen — `Robb.`, `Robb-`, `Mr Robb` and
+            # `R. Robb` all collapse onto one check that way (SAN-338 found
+            # every one of those walking through a narrower rule).
+            actor_norm=$(printf '%s' "$marker_actor" | tr -cd '[:alpha:]' | tr '[:upper:]' '[:lower:]')
+            case "$actor_norm" in *robb*) reserved=1 ;; *) reserved=0 ;; esac
+            if [ "$reserved" -eq 1 ]; then
+              echo "FAIL CLOSED: a codex-p1-ack marker must name the acting agent; Robb cannot be claimed on this path (SAN-343)."
+            else
+              identity_valid=true
+              actor="$marker_actor"
+              actor_kind="self-declared"
+              echo "Agent acknowledgement: ${actor}, run ${marker_run}, marker at ${marker_at}, label at ${label_time}."
+            fi
+          else
+            echo "FAIL CLOSED: malformed or missing codex-p1-ack marker before the label at ${label_time}. Expected <!-- codex-p1-ack: actor=<Your Name>; run=<multica run uuid> --> (SAN-343)."
+          fi
 
           prior=$(
             gh api --paginate "repos/${{ github.repository }}/commits/${HEAD_SHA}/statuses" \
               | jq -s -r '[.[] | .[] | select(.context == "codex-review")] | sort_by(.created_at) | last | .state // "none"'
           )
 
-          if [ "$has_label" = "true" ]; then
+          # AN UNVALIDATABLE MARKER SCOPES NOTHING. Emitting a scope for a
+          # claim this step just rejected would silence findings on the
+          # strength of that rejected claim. Empty ack_time leaves every
+          # finding live, and the verdict step turns that into a failure
+          # whenever the acknowledgement was load-bearing.
+          if [ "$has_label" = "true" ] && [ "$identity_valid" = "true" ]; then
             echo "active=true" >> "$GITHUB_OUTPUT"
-            echo "ack_time=${ack_time}" >> "$GITHUB_OUTPUT"
-            echo "Override active: codex-p1-ack applied by ${actor} at ${ack_time}; findings after that time still block."
+            echo "ack_time=${marker_at}" >> "$GITHUB_OUTPUT"
+            echo "Override active: codex-p1-ack declared by ${actor} at ${marker_at} (label at ${label_time}); findings from that moment on still block."
+          elif [ "$has_label" = "true" ]; then
+            echo "active=true" >> "$GITHUB_OUTPUT"
+            echo "ack_time=" >> "$GITHUB_OUTPUT"
+            echo "Override present but its identity could not be established; scoping nothing."
           else
             echo "active=false" >> "$GITHUB_OUTPUT"
             echo "ack_time=" >> "$GITHUB_OUTPUT"
           fi
-          echo "actor=${actor}" >> "$GITHUB_OUTPUT"
+          # CLAMPED: the declared actor is the only unbounded part of a status
+          # description and GitHub truncates those at 140 characters. The
+          # marker pattern admits 71 characters of name, enough to push the
+          # trailing `(self-declared)` off the end — i.e. exactly the part that
+          # stops the status reading as a verified sign-off.
+          echo "actor=${actor:0:48}" >> "$GITHUB_OUTPUT"
+          echo "actor_kind=${actor_kind}" >> "$GITHUB_OUTPUT"
+          echo "identity_valid=${identity_valid}" >> "$GITHUB_OUTPUT"
           echo "prior=${prior}" >> "$GITHUB_OUTPUT"
           # Withdrawn = the label has been removed at least once and is not
           # on now. Used to fail closed if severity cannot be re-derived.
@@ -691,6 +853,8 @@ jobs:
           UNCLASSIFIED: ${{ steps.severity.outputs.unclassified }}
           OVERRIDE: ${{ steps.override.outputs.active }}
           OVERRIDE_ACTOR: ${{ steps.override.outputs.actor }}
+          OVERRIDE_ACTOR_KIND: ${{ steps.override.outputs.actor_kind }}
+          OVERRIDE_IDENTITY_VALID: ${{ steps.override.outputs.identity_valid }}
           WITHDRAWN: ${{ steps.override.outputs.withdrawn }}
           PRIOR: ${{ steps.override.outputs.prior }}
         run: |
@@ -719,7 +883,24 @@ jobs:
 
           echo "post=true" >> "$GITHUB_OUTPUT"
 
-          if [ "${BLOCKING:-0}" -gt 0 ]; then
+          # Was the acknowledgement doing any work? If Codex filed nothing at
+          # all it changed nothing, and an unvalidatable marker on a clean PR
+          # should not manufacture a failure (SAN-343).
+          ack_load_bearing=0
+          if [ "${BLOCKING_TOTAL:-0}" -gt 0 ] || [ "${UNCLASSIFIED:-0}" -gt 0 ]; then
+            ack_load_bearing=1
+          fi
+
+          # IDENTITY IS CHECKED FIRST. An unvalidatable marker now scopes
+          # nothing, so every finding stays live and the BLOCKING clause below
+          # would catch this case anyway — but it would report it as a plain
+          # P0/P1. Leading with the identity message is the one that tells the
+          # reader what to actually do about it.
+          if [ "${OVERRIDE:-false}" = "true" ] && [ "$ack_load_bearing" -eq 1 ] && [ "${OVERRIDE_IDENTITY_VALID:-false}" != "true" ]; then
+            echo "state=failure" >> "$GITHUB_OUTPUT"
+            echo "description=codex-p1-ack identity not established — re-acknowledge with a valid PR marker" >> "$GITHUB_OUTPUT"
+            echo "FAILURE: acknowledgement identity cannot be established; failing closed."
+          elif [ "${BLOCKING:-0}" -gt 0 ]; then
             echo "state=failure" >> "$GITHUB_OUTPUT"
             echo "description=Codex filed ${BLOCKING} P0/P1 on this commit — fix, or label codex-p1-ack" >> "$GITHUB_OUTPUT"
             echo "FAILURE: ${BLOCKING} live blocking finding(s)."
@@ -729,8 +910,8 @@ jobs:
             echo "FAILURE: ${UNCLASSIFIED} unclassified finding(s); failing closed on format drift."
           elif [ "${OVERRIDE:-false}" = "true" ] && [ "${BLOCKING_TOTAL:-0}" -gt 0 ]; then
             echo "state=success" >> "$GITHUB_OUTPUT"
-            echo "description=${BLOCKING_TOTAL} P0/P1 dismissed via codex-p1-ack by ${OVERRIDE_ACTOR}" >> "$GITHUB_OUTPUT"
-            echo "SUCCESS: ${BLOCKING_TOTAL} finding(s) dismissed by ${OVERRIDE_ACTOR}; none raised since."
+            echo "description=${BLOCKING_TOTAL} P0/P1 dismissed via codex-p1-ack by ${OVERRIDE_ACTOR} (${OVERRIDE_ACTOR_KIND})" >> "$GITHUB_OUTPUT"
+            echo "SUCCESS: ${BLOCKING_TOTAL} finding(s) dismissed by ${OVERRIDE_ACTOR} (${OVERRIDE_ACTOR_KIND}); none raised since."
           else
             echo "state=success" >> "$GITHUB_OUTPUT"
             echo "description=Codex reviewed this commit — no P0/P1" >> "$GITHUB_OUTPUT"
