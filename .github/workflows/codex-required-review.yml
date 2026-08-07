@@ -356,7 +356,7 @@ jobs:
   post-status:
     # issue_comment fires for both issue and PR comments — skip non-PR comments.
     if: github.event_name != 'issue_comment' || github.event.issue.pull_request != null
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64]
     steps:
       - name: Resolve PR number and head SHA
         id: pr
