@@ -1,11 +1,18 @@
 package service
 
 import (
+	"context"
+	"encoding/json"
+	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/multica-ai/multica/server/internal/events"
+	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
@@ -61,6 +68,130 @@ func TestTaskFailureReasonForAutopilotRun(t *testing.T) {
 				t.Fatalf("taskFailureReasonForAutopilotRun() = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+// TestAutopilotActiveRunLock exercises BLU-472 with concurrent dispatches
+// against PostgreSQL. The uniqueness constraint is the cross-process lock;
+// this test verifies the loser becomes a visible skip rather than a second
+// task, and that the lock releases when the winner reaches a terminal state.
+func TestAutopilotActiveRunLock(t *testing.T) {
+	pool := newResolveOriginatorPool(t)
+	ctx := context.Background()
+	q := db.New(pool)
+	workspaceID, userID, agentID, _ := seedAttributionFixture(t, pool)
+
+	var autopilotID string
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO autopilot (workspace_id, title, assignee_type, assignee_id, status, execution_mode, created_by_type, created_by_id)
+		VALUES ($1, 'active-run lock', 'agent', $2, 'active', 'run_only', 'member', $3)
+		RETURNING id`, workspaceID, agentID, userID).Scan(&autopilotID); err != nil {
+		t.Fatalf("seed autopilot: %v", err)
+	}
+	t.Cleanup(func() { _, _ = pool.Exec(context.Background(), `DELETE FROM autopilot WHERE id = $1`, autopilotID) })
+	ap, err := q.GetAutopilot(ctx, util.MustParseUUID(autopilotID))
+	if err != nil {
+		t.Fatalf("load autopilot: %v", err)
+	}
+	taskSvc := &TaskService{Queries: q, TxStarter: pool, Bus: events.New()}
+	svc := &AutopilotService{Queries: q, TxStarter: pool, Bus: events.New(), TaskSvc: taskSvc}
+
+	start := make(chan struct{})
+	results := make(chan *db.AutopilotRun, 2)
+	errs := make(chan error, 2)
+	var wg sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			run, dispatchErr := svc.DispatchAutopilot(ctx, ap, pgtype.UUID{}, "manual", nil)
+			if dispatchErr != nil {
+				errs <- dispatchErr
+				return
+			}
+			results <- run
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	close(results)
+	for dispatchErr := range errs {
+		t.Fatalf("concurrent dispatch: %v", dispatchErr)
+	}
+
+	var activeRuns, skippedRuns, tasks int
+	if err := pool.QueryRow(ctx, `
+		SELECT
+			count(*) FILTER (WHERE status IN ('pending', 'issue_created', 'running')),
+			count(*) FILTER (WHERE status = 'skipped')
+		FROM autopilot_run WHERE autopilot_id = $1`, autopilotID).Scan(&activeRuns, &skippedRuns); err != nil {
+		t.Fatalf("count autopilot runs: %v", err)
+	}
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) FROM agent_task_queue t
+		JOIN autopilot_run r ON r.task_id = t.id
+		WHERE r.autopilot_id = $1`, autopilotID).Scan(&tasks); err != nil {
+		t.Fatalf("count autopilot tasks: %v", err)
+	}
+	if activeRuns != 1 || skippedRuns != 1 || tasks != 1 {
+		t.Fatalf("concurrent dispatch persisted active=%d skipped=%d tasks=%d; want 1, 1, 1", activeRuns, skippedRuns, tasks)
+	}
+
+	var activeID, skipReason string
+	var skipResult []byte
+	if err := pool.QueryRow(ctx, `SELECT id FROM autopilot_run WHERE autopilot_id = $1 AND status = 'running'`, autopilotID).Scan(&activeID); err != nil {
+		t.Fatalf("load active run: %v", err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT failure_reason, result FROM autopilot_run WHERE autopilot_id = $1 AND status = 'skipped'`, autopilotID).Scan(&skipReason, &skipResult); err != nil {
+		t.Fatalf("load skipped reason: %v", err)
+	}
+	if !strings.Contains(skipReason, "another autopilot run is active") || !strings.Contains(skipReason, activeID) {
+		t.Fatalf("skip reason = %q, want contention and active run %s", skipReason, activeID)
+	}
+	var skipPayload map[string]string
+	if err := json.Unmarshal(skipResult, &skipPayload); err != nil {
+		t.Fatalf("decode skip result %s: %v", skipResult, err)
+	}
+	if skipPayload["status"] != "skipped" || skipPayload["active_run_id"] != activeID {
+		t.Fatalf("skip result = %s, want skipped status and active run %s", skipResult, activeID)
+	}
+	t.Logf("BLU-472 contention: active run=%s; contender skipped: %s", activeID, skipReason)
+
+	task, err := q.GetAutopilotTaskByRun(ctx, util.MustParseUUID(activeID))
+	if err != nil {
+		t.Fatalf("load holder task: %v", err)
+	}
+	// A deferred retry is still live work. In particular, it can wait longer
+	// than the orphan admission timeout, so recovery must not steal its lock.
+	if _, err := pool.Exec(ctx, `UPDATE agent_task_queue SET status = 'deferred', fire_at = now() + interval '1 hour' WHERE id = $1`, task.ID); err != nil {
+		t.Fatalf("defer holder task: %v", err)
+	}
+	if _, err := q.RecoverStaleAutopilotRunWithoutActiveTask(ctx, db.RecoverStaleAutopilotRunWithoutActiveTaskParams{
+		ID: util.MustParseUUID(activeID), RecoverySecs: 0,
+	}); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("deferred holder was recoverable: err=%v, want no rows", err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE agent_task_queue SET status = 'running', fire_at = NULL WHERE id = $1`, task.ID); err != nil {
+		t.Fatalf("restore holder task: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE agent_task_queue SET status = 'failed', completed_at = now(), error = 'daemon killed', failure_reason = 'runtime_recovery' WHERE id = $1`, task.ID); err != nil {
+		t.Fatalf("simulate killed holder: %v", err)
+	}
+	task.Status = "failed"
+	task.Error = pgtype.Text{String: "daemon killed", Valid: true}
+	svc.SyncRunFromTask(ctx, task)
+	if run, err := q.GetAutopilotRun(ctx, util.MustParseUUID(activeID)); err != nil || run.Status != "failed" {
+		t.Fatalf("stale holder recovery left run status=%q err=%v, want failed", run.Status, err)
+	}
+	t.Logf("BLU-472 stale-holder recovery: run=%s released after daemon kill", activeID)
+	third, err := svc.DispatchAutopilot(ctx, ap, pgtype.UUID{}, "manual", nil)
+	if err != nil {
+		t.Fatalf("dispatch after terminal release: %v", err)
+	}
+	if third.Status != "running" {
+		t.Fatalf("dispatch after terminal release status = %q, want running", third.Status)
 	}
 }
 

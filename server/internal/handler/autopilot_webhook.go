@@ -24,6 +24,7 @@ import (
 
 	obsmetrics "github.com/multica-ai/multica/server/internal/metrics"
 	"github.com/multica-ai/multica/server/internal/middleware"
+	"github.com/multica-ai/multica/server/internal/service"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
@@ -571,6 +572,29 @@ func (h *Handler) HandleAutopilotWebhook(w http.ResponseWriter, r *http.Request)
 		delivery.ID,
 	)
 	if err != nil {
+		var activeErr *service.ActiveAutopilotRunError
+		if errors.As(err, &activeErr) {
+			respBody := map[string]any{
+				"status":        "deferred",
+				"delivery_id":   uuidToString(delivery.ID),
+				"reason":        "another_autopilot_run_active",
+				"active_run_id": uuidToString(activeErr.RunID),
+			}
+			bodyJSON, _ := json.Marshal(respBody)
+			if _, ackErr := h.Queries.AcknowledgeWebhookDelivery(r.Context(), db.AcknowledgeWebhookDeliveryParams{
+				ID:             delivery.ID,
+				ResponseStatus: pgtype.Int4{Int32: http.StatusConflict, Valid: true},
+				ResponseBody:   pgtype.Text{String: string(bodyJSON), Valid: true},
+			}); ackErr != nil {
+				slog.Warn("webhook: persist deferred acknowledgement metadata failed", "delivery_id", uuidToString(delivery.ID), "error", ackErr)
+			}
+			if h.WebhookDeliveryWorker != nil {
+				h.WebhookDeliveryWorker.Notify()
+			}
+			w.Header().Set("Retry-After", "30")
+			writeJSON(w, http.StatusConflict, respBody)
+			return
+		}
 		slog.Warn("webhook admission failed",
 			"trigger_id", uuidToString(trigRow.ID),
 			"autopilot_id", uuidToString(autopilot.ID),

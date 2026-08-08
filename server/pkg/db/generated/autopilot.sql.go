@@ -549,6 +549,41 @@ func (q *Queries) GetActiveAutopilotRuleVersion(ctx context.Context, arg GetActi
 	return i, err
 }
 
+const getActiveAutopilotRun = `-- name: GetActiveAutopilotRun :one
+SELECT id, autopilot_id, trigger_id, source, status, issue_id, task_id, triggered_at, completed_at, failure_reason, trigger_payload, result, created_at, squad_id, planned_at, webhook_delivery_id FROM autopilot_run
+WHERE autopilot_id = $1
+  AND status IN ('issue_created', 'running')
+ORDER BY created_at ASC
+LIMIT 1
+`
+
+// Reads the holder of BLU-472's per-autopilot admission lock after a contender
+// lost the unique-index race. The run ID is included in the skip record so a
+// human can see exactly why this occurrence did not start.
+func (q *Queries) GetActiveAutopilotRun(ctx context.Context, autopilotID pgtype.UUID) (AutopilotRun, error) {
+	row := q.db.QueryRow(ctx, getActiveAutopilotRun, autopilotID)
+	var i AutopilotRun
+	err := row.Scan(
+		&i.ID,
+		&i.AutopilotID,
+		&i.TriggerID,
+		&i.Source,
+		&i.Status,
+		&i.IssueID,
+		&i.TaskID,
+		&i.TriggeredAt,
+		&i.CompletedAt,
+		&i.FailureReason,
+		&i.TriggerPayload,
+		&i.Result,
+		&i.CreatedAt,
+		&i.SquadID,
+		&i.PlannedAt,
+		&i.WebhookDeliveryID,
+	)
+	return i, err
+}
+
 const getAutopilot = `-- name: GetAutopilot :one
 SELECT id, workspace_id, title, description, assignee_id, status, execution_mode, issue_title_template, created_by_type, created_by_id, last_run_at, created_at, updated_at, assignee_type, project_id FROM autopilot
 WHERE id = $1
@@ -1305,6 +1340,57 @@ WHERE id = $1
 func (q *Queries) RecoverPartialAutopilotRun(ctx context.Context, id pgtype.UUID) error {
 	_, err := q.db.Exec(ctx, recoverPartialAutopilotRun, id)
 	return err
+}
+
+const recoverStaleAutopilotRunWithoutActiveTask = `-- name: RecoverStaleAutopilotRunWithoutActiveTask :one
+UPDATE autopilot_run r
+SET status = 'failed',
+    completed_at = now(),
+    failure_reason = 'stale active run recovered: no active downstream task'
+WHERE r.id = $1
+  AND r.status IN ('issue_created', 'running')
+  AND r.triggered_at < now() - make_interval(secs => $2::double precision)
+  AND NOT EXISTS (
+      SELECT 1
+      FROM agent_task_queue t
+      WHERE (t.id = r.task_id OR (r.issue_id IS NOT NULL AND t.issue_id = r.issue_id))
+        AND t.status IN ('queued', 'dispatched', 'waiting_local_directory', 'running', 'deferred')
+  )
+RETURNING r.id, r.autopilot_id, r.trigger_id, r.source, r.status, r.issue_id, r.task_id, r.triggered_at, r.completed_at, r.failure_reason, r.trigger_payload, r.result, r.created_at, r.squad_id, r.planned_at, r.webhook_delivery_id
+`
+
+type RecoverStaleAutopilotRunWithoutActiveTaskParams struct {
+	ID           pgtype.UUID `json:"id"`
+	RecoverySecs float64     `json:"recovery_secs"`
+}
+
+// A run that died between creating its row and creating/linking its downstream
+// task cannot be cleaned up by the ordinary task liveness sweep. After the
+// bounded recovery window, release only that orphaned holder. Any queued,
+// dispatched, waiting, or running downstream task keeps the lock alive;
+// normal task failure/retry handling owns those rows instead.
+func (q *Queries) RecoverStaleAutopilotRunWithoutActiveTask(ctx context.Context, arg RecoverStaleAutopilotRunWithoutActiveTaskParams) (AutopilotRun, error) {
+	row := q.db.QueryRow(ctx, recoverStaleAutopilotRunWithoutActiveTask, arg.ID, arg.RecoverySecs)
+	var i AutopilotRun
+	err := row.Scan(
+		&i.ID,
+		&i.AutopilotID,
+		&i.TriggerID,
+		&i.Source,
+		&i.Status,
+		&i.IssueID,
+		&i.TaskID,
+		&i.TriggeredAt,
+		&i.CompletedAt,
+		&i.FailureReason,
+		&i.TriggerPayload,
+		&i.Result,
+		&i.CreatedAt,
+		&i.SquadID,
+		&i.PlannedAt,
+		&i.WebhookDeliveryID,
+	)
+	return i, err
 }
 
 const rotateAutopilotTriggerWebhookToken = `-- name: RotateAutopilotTriggerWebhookToken :one
