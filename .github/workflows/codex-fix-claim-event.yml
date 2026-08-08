@@ -1,0 +1,21 @@
+name: Codex Fix Claim Event
+run-name: ${{ github.event.pull_request.number }}
+
+# Fork review-comment workflows receive a read-only token. This bridge does no
+# privileged work. Codex Required Review re-grades durable evidence when this
+# run completes, using its base-repository workflow_run token (SAN-349).
+on:
+  pull_request_review_comment:
+    types: [created, edited, deleted]
+
+permissions: {}
+
+jobs:
+  observed:
+    # Self-hosted like every other workflow in this repo. Ported from martin,
+    # which still says ubuntu-latest: from 2026-08-07T04:10Z the account's
+    # GitHub-hosted runner requests were denied for failed payment, and a
+    # bridge that cannot start is a fix-claim route that never re-grades.
+    runs-on: [self-hosted, Linux, X64]
+    steps:
+      - run: echo "Review-comment evidence changed; request a durable re-grade."
